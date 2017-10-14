@@ -2720,6 +2720,9 @@ roadtrip
         prevRoute.view.destroy();
       }
       route.view = createView(Post, route.data);
+      if ((route.data.post || {}).title) {
+        window.document.title = route.data.post.title + ' - Cyandev';
+      }
     }
   })
   .start({
@@ -2748,6 +2751,7 @@ function createRoute(Component, data) {
         prevRoute.view.destroy();
       }
       route.view = createView(Component, data);
+      window.document.title = 'Cyandev';
     },
 
     leave: function leave(route, nextRoute) {
