@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>
+深入 Swift Runtime 之 TrailingObjects - Cyandev&#x27;s Blog
+</title>
+    
+    <meta http-equiv="content-type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+    <meta name="robots" content="noodp"/>
+
+    <link rel="stylesheet" href="https://unixzii.github.io/style.css">
+    <link rel="stylesheet" href="https://unixzii.github.io/color/orange.css">
+
+        <link rel="stylesheet" href="https://unixzii.github.io/color/background_blue.css">
+    
+    <link rel="stylesheet" href="https://unixzii.github.io/font-hack-subset.css">
+
+    </head>
+
+<body class="">
+<div class="container">
+    
+    
+
+    <aside class="aside">
+        <div class="adaptive-container">
+            <div class="aside__logo">
+                <!-- Customized logo area (will not be affected by config) -->
+                <strong>Cyandev's</strong>
+                <br>
+                <span style="font-weight: 100;">Blog</span>
+            </div>
+            <div class="aside__menu">
+                
+                    
+                <nav class="menu">
+            <ul class="menu__inner">
+                <li class="active"><a href="https://unixzii.github.io/">posts</a></li>
+            
+                <li><a href="https://unixzii.github.io//archive">archive</a></li>
+            
+                <li><a href="https://unixzii.github.io//tags">tags</a></li>
+            
+                <li><a href="https://unixzii.github.io//about">about</a></li>
+            </ul>
+        </nav>
+    
+    
+                
+            </div>
+        </div>
+    </aside>
+
+    <div class="content">
+        
+    <div class="post">
+        
+    <h1 class="post-title"><a href="https://unixzii.github.io/swift-runtime-trailing-objects/">深入 Swift Runtime 之 TrailingObjects</a></h1>
+    <div class="post-meta-inline">
+        
+    <span class="post-date">
+            2021-12-06
+        </span>
+
+    </div>
+
+    
+        <span class="post-tags-inline">
+                :: tags:&nbsp;
+                <a class="post-tag" href="https://unixzii.github.io/tags/swift/">#swift</a>&nbsp;
+                <a class="post-tag" href="https://unixzii.github.io/tags/internals/">#internals</a></span>
+    
+
+        
+        <div class="post-content">
+            <p>Swift Runtime 底层结构和行为大量使用 C++ 开发，因此如果想要深入分析 Runtime 的原理或者 ABI 的内存布局等就需要对这部分 C++ 代码有所了解。Swift 的 C++ 源码中使用了很多“黑魔法”，尤其是模板，可能对 C++ 新手来说会比较劝退。本文就带大家深入浅出地分析其源码中的一个模板结构 <code>TrailingObjects</code>，揭开 Swift Runtime 的冰山一角。</p>
+<h2 id="jian-dan-liao-liao-swift-abi">简单聊聊 Swift ABI</h2>
+<p>据 Apple 称，自 Swift 5.0 起，其 ABI 在 Apple 平台上就稳定了，这意味着 Swift 5.0 的编译产物在内存布局、runtime 调用上就不会发生变化了，也意味着你可以更换任意一个 ABI 兼容的标准库（<code>libSwiftCore.dylib</code>）。因此在新的 iOS 版本中，app 就可以不将额外的 Swift Runtime 内嵌到 bundle 中了，从而节省了一部分包体积。</p>
+<p>ABI 的稳定也意味着我们可以直接更换编译好的可执行二进制产物的 Swift Runtime，并通过自己编译的 runtime 来调试其内部数据结构和行为。亦或者直接将 Swift Runtime 的头文件引入自己的工程中来调用（毕竟内存布局是一样的，所有的结构可以完全匹配上）。</p>
+<h2 id="ru-he-diao-shi-runtime">如何调试 Runtime</h2>
+<p>自己编译好 Swift 工具链后可以得到可调试的 <code>libSwiftCore.dylib</code>， 但直接 link 它的话在运行时还是会加在系统中的动态库，因为产物默认的 <code>LC_ID_DYLIB</code> 是系统路径，这里为了方便我们可以直接通过 <code>install_name_tool -change</code> 更换可执行的 <code>LC_LOAD_DYLIB</code> command，让它加载我们的 runtime。</p>
+<p><img src="/images/swift-runtime-trailing-objects/1.png" alt="otool" /></p>
+<p>更改好后我们在 runtime 代码里打一个断点，发现调试器可以成功断在里面并且可以随意访问变量和步进执行。</p>
+<p><img src="/images/swift-runtime-trailing-objects/2.png" alt="Xcode Breakpoints" /></p>
+<h2 id="ren-shi-di-yi-ge-runtime-jie-gou">认识第一个 Runtime 结构</h2>
+<p>Swift Runtime 中的数据结构很多，有运行时产生的，也有编译链接时产生的。我们这里来看一个编译时产生的重要结构：<code>Metadata</code>。它表示一个类型的元数据，runtime 的方方面面都依赖这个信息。在 Swift 中的表示为 <code>T.Type</code>，即 <code>T.self</code> 的返回值类型。我们可以通过反编译下面这个简单的代码片段来看一下它在运行时是怎么获取的：</p>
+<pre data-lang="Swift" style="background-color:#2b303b;color:#c0c5ce;" class="language-Swift "><code class="language-Swift" data-lang="Swift"><span style="color:#b48ead;">func </span><span>takeType&lt;T&gt;(_ t: T.</span><span style="color:#b48ead;">Type</span><span>) { }
+</span><span>
+</span><span>takeType(Foo.</span><span style="color:#b48ead;">self</span><span>)  </span><span style="color:#65737e;">// Line to decompile
+</span></code></pre>
+<p>反编译结果如下：</p>
+<p><img src="/images/swift-runtime-trailing-objects/3.png" alt="Hopper" /></p>
+<p>可以看到 takeType 的第一个参数为一个指针，指向了 <code>_$s4test3FooVMf</code> 这个符号加偏移量 8 的地址。这个符号 demangle 之后的符号名为 <code>full type metadata for test.Foo</code>，内容如下：</p>
+<p><img src="/images/swift-runtime-trailing-objects/4.png" alt="Hopper" /></p>
+<p>其 + 8 后的地址为另一个符号，但内容 hopper 无法解析。</p>
+<p>之前我们说过，<code>Metadata</code> 结构对应的 Swift 类型为 <code>T.Type</code>，那么这个 <code>_$s4test3FooVMf + 8</code> 的地址必然存放了与 <code>Metadata</code> 布局相同的内容。</p>
+<p>我们来看一下 <code>Metadata</code> 在 C++ 代码中的定义（已简化，完整代码链接也贴在了文章最后）：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> Runtime&gt; </span><span style="color:#b48ead;">struct </span><span>TargetMetadata;
+</span><span style="color:#b48ead;">using </span><span>Metadata = TargetMetadata&lt;InProcess&gt;;
+</span><span>
+</span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> Runtime&gt;
+</span><span style="color:#b48ead;">struct </span><span>TargetMetadata {
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredPointer = </span><span style="color:#b48ead;">typename</span><span> Runtime::StoredPointer;
+</span><span>
+</span><span>  </span><span style="color:#65737e;">/// The basic header type.
+</span><span>  </span><span style="color:#b48ead;">typedef</span><span> TargetTypeMetadataHeader&lt;Runtime&gt; HeaderType;
+</span><span>
+</span><span>  </span><span style="color:#b48ead;">constexpr </span><span style="color:#8fa1b3;">TargetMetadata</span><span>()
+</span><span>    : </span><span style="color:#bf616a;">Kind</span><span>(static_cast&lt;StoredPointer&gt;(MetadataKind::Class)) {}
+</span><span>  </span><span style="color:#b48ead;">constexpr </span><span style="color:#8fa1b3;">TargetMetadata</span><span>(MetadataKind </span><span style="color:#bf616a;">Kind</span><span>)
+</span><span>    : </span><span style="color:#bf616a;">Kind</span><span>(static_cast&lt;StoredPointer&gt;(Kind)) {}
+</span><span>
+</span><span style="color:#b48ead;">private</span><span>:
+</span><span>  </span><span style="color:#65737e;">/// The kind. Only valid for non-class metadata; getKind() must be used to get
+</span><span>  </span><span style="color:#65737e;">/// the kind value.
+</span><span>  StoredPointer Kind;
+</span><span style="color:#b48ead;">public</span><span>:
+</span><span>  </span><span style="color:#65737e;">/// Get the metadata kind.
+</span><span>  MetadataKind </span><span style="color:#8fa1b3;">getKind</span><span>() </span><span style="color:#b48ead;">const </span><span>{
+</span><span>    </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">getEnumeratedMetadataKind</span><span>(Kind);
+</span><span>  }
+</span><span>  
+</span><span>  </span><span style="color:#65737e;">/// Set the metadata kind.
+</span><span>  </span><span style="color:#b48ead;">void </span><span style="color:#8fa1b3;">setKind</span><span>(MetadataKind </span><span style="color:#bf616a;">kind</span><span>) {
+</span><span>    Kind = static_cast&lt;StoredPointer&gt;(kind);
+</span><span>  }
+</span><span>};
+</span></code></pre>
+<p>通过类型的定义可以看到，这个 <code>Metadata</code> 是 <code>TargetMetadata&lt;InProcess&gt;</code> 的 type-alias，为了方便我们后续都用 <code>Metadata</code> 代指后者。其存储字段只有一个 <code>StoredPointer</code> 类型的 <code>Kind</code> 变量。<code>StoredPointer</code> 定义在 Runtime 泛型中，代入 <code>InProcess</code> 可以看到定义（已简化）：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">struct </span><span>InProcess {
+</span><span>  </span><span style="color:#b48ead;">static constexpr </span><span>size_t PointerSize = sizeof(uintptr_t);
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredPointer = uintptr_t;
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredSignedPointer = uintptr_t;
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredSize = size_t;
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredPointerDifference = ptrdiff_t;
+</span><span>};
+</span></code></pre>
+<p>我们再来看下 MetadataKind 的定义：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">const unsigned</span><span> MetadataKindIsNonHeap = </span><span style="color:#d08770;">0x200</span><span>;
+</span><span>
+</span><span style="color:#b48ead;">enum class </span><span>MetadataKind : </span><span style="color:#a3be8c;">uint32_t </span><span>{
+</span><span style="color:#b48ead;">#define </span><span style="color:#8fa1b3;">METADATAKIND</span><span>(</span><span style="color:#bf616a;">name</span><span>, </span><span style="color:#bf616a;">value</span><span>) name = value,
+</span><span style="color:#b48ead;">#define </span><span style="color:#8fa1b3;">ABSTRACTMETADATAKIND</span><span>(</span><span style="color:#bf616a;">name</span><span>, </span><span style="color:#bf616a;">start</span><span>, </span><span style="color:#bf616a;">end</span><span>)                                 \
+</span><span>  name##_Start = start, name##_End = end,
+</span><span>  </span><span style="color:#65737e;">// content of: #include &quot;MetadataKind.def&quot;
+</span><span>  
+</span><span>  </span><span style="color:#b48ead;">#ifndef</span><span> NOMINALTYPEMETADATAKIND
+</span><span>	</span><span style="color:#b48ead;">#define </span><span style="color:#8fa1b3;">NOMINALTYPEMETADATAKIND</span><span>(</span><span style="color:#bf616a;">Name</span><span>, </span><span style="color:#bf616a;">Value</span><span>) </span><span style="color:#bf616a;">METADATAKIND</span><span>(Name, Value)
+</span><span>	</span><span style="color:#b48ead;">#endif
+</span><span>  
+</span><span>  </span><span style="color:#65737e;">/// A class type.
+</span><span>  </span><span style="color:#bf616a;">NOMINALTYPEMETADATAKIND</span><span>(Class, </span><span style="color:#d08770;">0</span><span>)
+</span><span>
+</span><span>  </span><span style="color:#65737e;">/// A struct type.
+</span><span>  </span><span style="color:#bf616a;">NOMINALTYPEMETADATAKIND</span><span>(Struct, </span><span style="color:#d08770;">0 </span><span>| MetadataKindIsNonHeap)
+</span><span>
+</span><span>  </span><span style="color:#65737e;">/// An enum type.
+</span><span>  </span><span style="color:#65737e;">/// If we add reference enums, that needs to go here.
+</span><span>  </span><span style="color:#bf616a;">NOMINALTYPEMETADATAKIND</span><span>(Enum, </span><span style="color:#d08770;">1 </span><span>| MetadataKindIsNonHeap)
+</span><span>  
+</span><span>  </span><span style="color:#65737e;">// ...
+</span><span>};
+</span><span>
+</span></code></pre>
+<p>刚才反编译看到的那段未知数据在内存布局上就与这个 <code>Kind</code> 对应，按值匹配即为 <code>Struct</code>。到这里大家可能就会好奇了，为什么 <code>_$s4test3FooVMf + 8</code> 才是 <code>Metadata</code> 呢，那 <code>_$s4test3FooVMf</code> 对应的是什么呢？这里先不展开，相信大家按照本文的思路也能自己找到它的定义。</p>
+<h2 id="metadata-zi-lei">Metadata 子类？</h2>
+<p>到这里我们已经正式将一个类型横跨 Swift - 二进制 - C++ 进行了对接，接下来我们就来继续分析其他的结构。通过 <code>Metadata</code> 的定义我们应该能猜到，它不可能承载所有的信息，那么不同类型的详细信息都在哪里呢？这就要引出它的“子类”们了。以本文分析的 struct 为例，其真实 <code>Metadata</code> 类型是 <code>StructMetadata</code> (aka. <code>TargetStructMetadata&lt;InProcess&gt;</code>)，结构定义及类型层次如下：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> Runtime&gt;
+</span><span style="color:#b48ead;">struct </span><span>TargetValueMetadata : </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">TargetMetadata</span><span>&lt;Runtime&gt; {
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredPointer = </span><span style="color:#b48ead;">typename</span><span> Runtime::StoredPointer;
+</span><span>  </span><span style="color:#8fa1b3;">TargetValueMetadata</span><span>(MetadataKind </span><span style="color:#bf616a;">Kind</span><span>,
+</span><span>                      </span><span style="color:#b48ead;">const</span><span> TargetTypeContextDescriptor&lt;Runtime&gt; *</span><span style="color:#bf616a;">description</span><span>)
+</span><span>      : </span><span style="color:#bf616a;">TargetMetadata</span><span>&lt;Runtime&gt;(Kind), </span><span style="color:#bf616a;">Description</span><span>(description) {}
+</span><span>
+</span><span>  </span><span style="color:#65737e;">/// An out-of-line description of the type.
+</span><span>  TargetSignedPointer&lt;Runtime, </span><span style="color:#b48ead;">const</span><span> TargetValueTypeDescriptor&lt;Runtime&gt; * __ptrauth_swift_type_descriptor&gt; Description;
+</span><span>};
+</span><span>
+</span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> Runtime&gt;
+</span><span style="color:#b48ead;">struct </span><span>TargetStructMetadata : </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">TargetValueMetadata</span><span>&lt;Runtime&gt; {
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredPointer = </span><span style="color:#b48ead;">typename</span><span> Runtime::StoredPointer;
+</span><span>  </span><span style="color:#b48ead;">using</span><span> TargetValueMetadata&lt;Runtime&gt;::TargetValueMetadata;
+</span><span>
+</span><span>  </span><span style="color:#b48ead;">const</span><span> TargetStructDescriptor&lt;Runtime&gt; *</span><span style="color:#8fa1b3;">getDescription</span><span>() </span><span style="color:#b48ead;">const </span><span>{
+</span><span>    </span><span style="color:#b48ead;">return </span><span>llvm::</span><span style="color:#bf616a;">cast</span><span>&lt;TargetStructDescriptor&lt;Runtime&gt;&gt;(</span><span style="color:#bf616a;">this</span><span>-&gt;</span><span style="color:#bf616a;">Description</span><span>);
+</span><span>  }
+</span><span>
+</span><span>  </span><span style="color:#65737e;">/// Get a pointer to the field offset vector, if present, or null.
+</span><span>  </span><span style="color:#b48ead;">const </span><span>uint32_t *</span><span style="color:#8fa1b3;">getFieldOffsets</span><span>() </span><span style="color:#b48ead;">const </span><span>{
+</span><span>    </span><span style="color:#b48ead;">auto</span><span> offset = </span><span style="color:#bf616a;">getDescription</span><span>()-&gt;</span><span style="color:#bf616a;">FieldOffsetVectorOffset</span><span>;
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(offset == </span><span style="color:#d08770;">0</span><span>)
+</span><span>      </span><span style="color:#b48ead;">return </span><span style="color:#d08770;">nullptr</span><span>;
+</span><span>    </span><span style="color:#b48ead;">auto</span><span> asWords = reinterpret_cast&lt;</span><span style="color:#b48ead;">const void </span><span>* </span><span style="color:#b48ead;">const</span><span>*&gt;(</span><span style="color:#bf616a;">this</span><span>);
+</span><span>    </span><span style="color:#b48ead;">return </span><span>reinterpret_cast&lt;</span><span style="color:#b48ead;">const </span><span>uint32_t *&gt;(asWords + offset);
+</span><span>  }
+</span><span>};
+</span></code></pre>
+<p>可以看到 <code>StructMetadata</code> 本质上与 <code>ValueMetadata</code> 内存布局一致，仅当类型不同时有不同的运行时行为。<code>ValueMetadata</code> 在公共的 <code>Kind</code> 字段下又增加了 <code>Description</code> 字段，通过类型分析也是一个指针。这个字段指向了一个外联的描述结构，这个结构也是本文要重点分析的。</p>
+<h2 id="targetstructdescriptor">TargetStructDescriptor</h2>
+<p>先看定义：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> Runtime&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TargetStructDescriptor </span><span style="color:#b48ead;">final
+</span><span style="color:#eff1f5;">    : </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">TargetValueTypeDescriptor</span><span style="color:#eff1f5;">&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">      </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">TrailingGenericContextObjects</span><span style="color:#eff1f5;">&lt;TargetStructDescriptor&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">                            TargetTypeGenericContextDescriptorHeader,
+</span><span style="color:#eff1f5;">                            </span><span style="color:#65737e;">/*additional trailing objects*/
+</span><span style="color:#eff1f5;">                            TargetForeignMetadataInitialization&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">                            TargetSingletonMetadataInitialization&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">                            TargetCanonicalSpecializedMetadatasListCount&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">                            TargetCanonicalSpecializedMetadatasListEntry&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">                            TargetCanonicalSpecializedMetadatasCachingOnceToken&lt;Runtime&gt;&gt; {
+</span><span style="color:#eff1f5;">    </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<p>说实话，刚开始看到这个类型我也懵了一下，但实际并没有看上去那么复杂。我们来一点一点分析。</p>
+<p>首先第一个父类 <code>TargetValueTypeDescriptor</code>，它其实是一个很简单的类型，提供了一些公共字段和行为，继承关系如下：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>TargetValueTypeDescriptor
+</span><span>`-- TargetTypeContextDescriptor
+</span><span>    `-- TargetContextDescriptor
+</span></code></pre>
+<p>比较麻烦的是它的第二个父类 <code>TrailingGenericContextObjects&lt;&amp;@#?%^@*&gt;</code>，这个类型的模板参数很多且雷同，一看就是个 <em>variadic template</em>，我们还是直接看定义：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template</span><span>&lt;</span><span style="color:#b48ead;">class</span><span> Self,
+</span><span>         </span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span>&gt; </span><span style="color:#b48ead;">class</span><span> TargetGenericContextHeaderType =
+</span><span>           TargetGenericContextDescriptorHeader,
+</span><span>         </span><span style="color:#b48ead;">typename</span><span>... FollowingTrailingObjects&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingGenericContextObjects</span><span>;
+</span><span>
+</span><span style="color:#b48ead;">template</span><span>&lt;</span><span style="color:#b48ead;">class</span><span> Runtime,
+</span><span>         </span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span>&gt; </span><span style="color:#b48ead;">class</span><span> TargetSelf,
+</span><span>         </span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span>&gt; </span><span style="color:#b48ead;">class</span><span> TargetGenericContextHeaderType,
+</span><span>         </span><span style="color:#b48ead;">typename</span><span>... FollowingTrailingObjects&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingGenericContextObjects</span><span style="color:#eff1f5;">&lt;TargetSelf&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">                                    TargetGenericContextHeaderType,
+</span><span style="color:#eff1f5;">                                    FollowingTrailingObjects</span><span>...</span><span style="color:#eff1f5;">&gt; :
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">protected </span><span style="color:#a3be8c;">swift::ABI::TrailingObjects</span><span style="color:#eff1f5;">&lt;TargetSelf&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">      TargetGenericContextHeaderType&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">      GenericParamDescriptor,
+</span><span style="color:#eff1f5;">      TargetGenericRequirementDescriptor&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">      FollowingTrailingObjects</span><span>...</span><span style="color:#eff1f5;">&gt;
+</span><span style="color:#eff1f5;">{ </span><span style="color:#65737e;">/* ... */ </span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<p>通过定义可知，<code>TrailingGenericContextObjects</code> 在使用时有两个定参（<code>Self</code>、<code>TargetGenericContextHeaderType</code>）和一个不定参模板参数（<code>FollowingTrailingObjects...</code>），下面有一个偏特化定义，主要作用是萃取 <code>Runtime</code> 参数以便后用。这个偏特化的定义直接继承了 <code>TrailingObjects</code>，即我们接下来要重点分析的类型，实现如下：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> BaseTy, </span><span style="color:#b48ead;">typename</span><span>... TrailingTys&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingObjects </span><span style="color:#eff1f5;">: </span><span style="color:#b48ead;">private </span><span style="color:#a3be8c;">trailing_objects_internal::TrailingObjectsImpl</span><span style="color:#eff1f5;">&lt;
+</span><span style="color:#eff1f5;">                            trailing_objects_internal::AlignmentCalcHelper&lt;
+</span><span style="color:#eff1f5;">                                TrailingTys</span><span>...</span><span style="color:#eff1f5;">&gt;::Alignment,
+</span><span style="color:#eff1f5;">                            BaseTy, TrailingObjects&lt;BaseTy, TrailingTys</span><span>...</span><span style="color:#eff1f5;">&gt;,
+</span><span style="color:#eff1f5;">                            BaseTy, TrailingTys</span><span>...</span><span style="color:#eff1f5;">&gt; {
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#b48ead;">private</span><span style="color:#eff1f5;">:
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// These two methods are the base of the recursion for this method.
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">static const</span><span style="color:#eff1f5;"> BaseTy </span><span>*
+</span><span style="color:#eff1f5;">  </span><span style="color:#8fa1b3;">getTrailingObjectsImpl</span><span style="color:#eff1f5;">(</span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;"> BaseTy </span><span>*</span><span style="color:#bf616a;">Obj</span><span style="color:#eff1f5;">,
+</span><span style="color:#eff1f5;">                         TrailingObjectsBase::OverloadToken&lt;BaseTy&gt;) {
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return</span><span style="color:#eff1f5;"> Obj;
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">static</span><span style="color:#eff1f5;"> BaseTy </span><span>*
+</span><span style="color:#eff1f5;">  </span><span style="color:#8fa1b3;">getTrailingObjectsImpl</span><span style="color:#eff1f5;">(BaseTy </span><span>*</span><span style="color:#bf616a;">Obj</span><span style="color:#eff1f5;">,
+</span><span style="color:#eff1f5;">                         TrailingObjectsBase::OverloadToken&lt;BaseTy&gt;) {
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return</span><span style="color:#eff1f5;"> Obj;
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#b48ead;">public</span><span style="color:#eff1f5;">:
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">/// Returns a pointer to the trailing object array of the given type
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">/// (which must be one of those specified in the class template). The
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">/// array may have zero or more elements in it.
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">template </span><span style="color:#eff1f5;">&lt;</span><span style="color:#b48ead;">typename</span><span style="color:#eff1f5;"> T&gt; </span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;"> T </span><span>*</span><span style="color:#8fa1b3;">getTrailingObjects</span><span style="color:#eff1f5;">() </span><span style="color:#b48ead;">const </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">    </span><span style="color:#65737e;">// Forwards to an impl function with overloads, since member
+</span><span style="color:#eff1f5;">    </span><span style="color:#65737e;">// function templates can&#39;t be specialized.
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">-&gt;</span><span style="color:#bf616a;">getTrailingObjectsImpl</span><span style="color:#eff1f5;">(
+</span><span style="color:#eff1f5;">        </span><span>static_cast</span><span style="color:#eff1f5;">&lt;</span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;"> BaseTy </span><span>*</span><span style="color:#eff1f5;">&gt;(</span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">),
+</span><span style="color:#eff1f5;">        TrailingObjectsBase::</span><span style="color:#bf616a;">OverloadToken</span><span style="color:#eff1f5;">&lt;T&gt;());
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<p>通过模板参数的声明我们可以大致猜想到，这个类型除了第一个模板参数（<code>BaseTy</code>），其他不定参模板参数的角色都是相同的，对应到 <code>TrailingGenericContextObjects</code> 类型上，除了第一个 <code>TargetSelf&lt;Runtime&gt;</code> 参数，其他参数 <code>TrailingObjects</code> 并不实际感知。那么就可以得出结论，<code>TrailingGenericContextObjects</code> 实际上就是为它的参数追加上一部分额外参数（与 Swift 泛型相关），传递给 <code>TrailingObjects</code> 使用，充当了一层装饰器。这里我们可以先忽略它的作用。</p>
+<h2 id="trailingobjects">TrailingObjects</h2>
+<p>接下来我们继续分析 <code>TrailingObjects</code>。</p>
+<p>通过前面的代码，我们可以看到这个类型定义了一些方法，但没有任何存储字段，并且可以看到它对接受的模板参数进行了一些类型计算，又传给了父类作为模板参数。其父类是 <code>TrailingObjects</code> 的核心实现，我们也一块来看一下定义：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">int</span><span> Align, </span><span style="color:#b48ead;">typename</span><span> BaseTy, </span><span style="color:#b48ead;">typename</span><span> TopTrailingObj, </span><span style="color:#b48ead;">typename</span><span> PrevTy,
+</span><span>          </span><span style="color:#b48ead;">typename</span><span>... MoreTys&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingObjectsImpl </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// The main template definition is never used -- the two
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// specializations cover all possibilities.
+</span><span style="color:#eff1f5;">}</span><span>;
+</span><span>
+</span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">int</span><span> Align, </span><span style="color:#b48ead;">typename</span><span> BaseTy, </span><span style="color:#b48ead;">typename</span><span> TopTrailingObj, </span><span style="color:#b48ead;">typename</span><span> PrevTy,
+</span><span>          </span><span style="color:#b48ead;">typename</span><span> NextTy, </span><span style="color:#b48ead;">typename</span><span>... MoreTys&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingObjectsImpl</span><span style="color:#eff1f5;">&lt;Align, BaseTy, TopTrailingObj, PrevTy, NextTy,
+</span><span style="color:#eff1f5;">                          MoreTys</span><span>...</span><span style="color:#eff1f5;">&gt;
+</span><span style="color:#eff1f5;">    : </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">TrailingObjectsImpl</span><span style="color:#eff1f5;">&lt;Align, BaseTy, TopTrailingObj, NextTy,
+</span><span style="color:#eff1f5;">                                 MoreTys</span><span>...</span><span style="color:#eff1f5;">&gt; {
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">}</span><span>;
+</span><span>
+</span><span style="color:#65737e;">/*
+</span><span style="color:#65737e;">  trailing_objects_internal::TrailingObjectsImpl&lt;
+</span><span style="color:#65737e;">    trailing_objects_internal::AlignmentCalcHelper&lt;TrailingTys...&gt;::Alignment,
+</span><span style="color:#65737e;">    BaseTy,
+</span><span style="color:#65737e;">    TrailingObjects&lt;BaseTy, TrailingTys...&gt;,
+</span><span style="color:#65737e;">    BaseTy,
+</span><span style="color:#65737e;">    TrailingTys...
+</span><span style="color:#65737e;">  &gt;
+</span><span style="color:#65737e;">*/
+</span></code></pre>
+<p>这个类型继承了它自己，因此这是一个递归模板，<strong>是处理不定参模板的一种手段</strong>。在这种模式下，每一层类型都可以获取到参数列表中的一项，然后把剩下的参数传给父类，那么它的父类就可以处理下一项，然后继续把剩下的参数传给父类...</p>
+<p>很像 Lisp 和 Haskell 等 FP 语言处理列表的方式，有兴趣的同学可以看看这篇文章：<a href="http://learnyouahaskell.com/recursion#maximum-awesome">Learn You a Haskell for Great Good! - Recursion</a></p>
+<p>但是自己继承自己如果没有终止条件就会死循环，因此一定存在一个(偏)特化用于终止递归：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#65737e;">// The base case of the TrailingObjectsImpl inheritance recursion,
+</span><span style="color:#65737e;">// when there&#39;s no more trailing types.
+</span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">int</span><span> Align, </span><span style="color:#b48ead;">typename</span><span> BaseTy, </span><span style="color:#b48ead;">typename</span><span> TopTrailingObj, </span><span style="color:#b48ead;">typename</span><span> PrevTy&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingObjectsImpl</span><span style="color:#eff1f5;">&lt;Align, BaseTy, TopTrailingObj, PrevTy&gt;
+</span><span style="color:#eff1f5;">    : </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">TrailingObjectsAligner</span><span style="color:#eff1f5;">&lt;Align&gt; {
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">}</span><span>;
+</span><span>
+</span><span style="color:#65737e;">/*
+</span><span style="color:#65737e;">  matching TrailingObjectsImpl&lt;Align, BaseTy, TopTrailingObj, NextTy, MoreTys...&gt;
+</span><span style="color:#65737e;">    with MoreTys = []
+</span><span style="color:#65737e;">*/
+</span></code></pre>
+<p>整个模板递归展开的过程大家可以使用 <strong>cppinsights</strong> 这个工具来查看，我这里已经做好了一个可编译的版本可以直接打开：<a href="https://cppinsights.io/s/8de0f488">https://cppinsights.io/s/8de0f488</a></p>
+<p>接下来我们来看递归的每层类型为最终的类型添加了什么内容：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingObjectsImpl</span><span style="color:#eff1f5;">&lt;Align, BaseTy, TopTrailingObj, </span><span style="color:#65737e;">/* 顶层完整类型 */
+</span><span style="color:#eff1f5;">    PrevTy, </span><span style="color:#65737e;">/* 上一层处理的模板参数 */
+</span><span style="color:#eff1f5;">    NextTy, </span><span style="color:#65737e;">/* 当前层处理的模板参数 */
+</span><span style="color:#eff1f5;">    MoreTys</span><span>... </span><span style="color:#65737e;">/* 下一层处理的模板参数列表 */</span><span style="color:#eff1f5;">&gt; </span><span style="color:#65737e;">/* : ... */ </span><span style="color:#eff1f5;">{
+</span><span style="color:#b48ead;">protected</span><span style="color:#eff1f5;">:
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">static const</span><span style="color:#eff1f5;"> NextTy </span><span>*
+</span><span style="color:#eff1f5;">  </span><span style="color:#8fa1b3;">getTrailingObjectsImpl</span><span style="color:#eff1f5;">(</span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;"> BaseTy </span><span>*</span><span style="color:#bf616a;">Obj</span><span style="color:#eff1f5;">,
+</span><span style="color:#eff1f5;">                         TrailingObjectsBase::OverloadToken&lt;NextTy&gt;) {
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">auto </span><span>*</span><span style="color:#eff1f5;">Ptr </span><span>= </span><span style="color:#eff1f5;">TopTrailingObj::</span><span style="color:#bf616a;">getTrailingObjectsImpl</span><span style="color:#eff1f5;">(
+</span><span style="color:#eff1f5;">                    Obj, TrailingObjectsBase::</span><span style="color:#bf616a;">OverloadToken</span><span style="color:#eff1f5;">&lt;PrevTy&gt;()) </span><span>+
+</span><span style="color:#eff1f5;">                TopTrailingObj::</span><span style="color:#bf616a;">callNumTrailingObjects</span><span style="color:#eff1f5;">(
+</span><span style="color:#eff1f5;">                    Obj, TrailingObjectsBase::</span><span style="color:#bf616a;">OverloadToken</span><span style="color:#eff1f5;">&lt;PrevTy&gt;());
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">if </span><span style="color:#eff1f5;">(</span><span style="color:#bf616a;">requiresRealignment</span><span style="color:#eff1f5;">())
+</span><span style="color:#eff1f5;">      </span><span style="color:#b48ead;">return </span><span>reinterpret_cast</span><span style="color:#eff1f5;">&lt;</span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;"> NextTy </span><span>*</span><span style="color:#eff1f5;">&gt;(
+</span><span style="color:#eff1f5;">          llvm::</span><span style="color:#bf616a;">alignAddr</span><span style="color:#eff1f5;">(Ptr, llvm::</span><span style="color:#bf616a;">Align</span><span style="color:#eff1f5;">(</span><span>alignof</span><span style="color:#eff1f5;">(NextTy))));
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">else
+</span><span style="color:#eff1f5;">      </span><span style="color:#b48ead;">return </span><span>reinterpret_cast</span><span style="color:#eff1f5;">&lt;</span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;"> NextTy </span><span>*</span><span style="color:#eff1f5;">&gt;(Ptr);
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<p>可以看到每一层都会有一个 <code>getTrailingObjectsImpl</code> 方法的重载，这个就是 <code>TrailingObjectsImpl</code> 最核心的方法，可以看到它能够返回当前层所处理的类型。同时他接受一个比较特殊的参数 <code>OverloadToken</code>，之所以存在这个参数是因为 C++ 不支持仅返回值不同的函数重载，也不支持模板函数的(偏)特化，因此这个参数是用来帮助编译器确定我们需要的重载版本的，函数体内并不需要关心其内容。其他语言中也有类似的技术，比如 Rust 的 <a href="https://doc.rust-lang.org/std/marker/struct.PhantomData.html">PhantomData</a>。</p>
+<p>继续来看函数的实现，它调用了 <code>TopTrailingObj</code> 的 <code>getTrailingObjectsImpl</code> 方法并传入了 <code>PrevTy</code> 构造的 <code>OverloadToken</code>。这里 <code>TopTrailingObj</code> 表示一个完整类型，可以像外界一样获取到整个类型层次中的所有成员。很明显这里其实也是一个递归调用，<code>PrevTy</code> 向前追溯是 <code>BaseTy</code>，所以我们看看返回 <code>BaseTy</code> 的重载版本，它位于 <code>TrailingObjects</code> 这个类型：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">static const</span><span> BaseTy *
+</span><span style="color:#8fa1b3;">getTrailingObjectsImpl</span><span>(</span><span style="color:#b48ead;">const</span><span> BaseTy *</span><span style="color:#bf616a;">Obj</span><span>,
+</span><span>                       TrailingObjectsBase::OverloadToken&lt;BaseTy&gt;) {
+</span><span>  </span><span style="color:#b48ead;">return</span><span> Obj;
+</span><span>}
+</span></code></pre>
+<p><code>callNumTrailingObjects</code> 则是直接调用到 <code>TopTrailingObj</code> 中的实现了，因为每层类型中并没有增加重载，它的实现如下：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> T&gt;
+</span><span>  </span><span style="color:#b48ead;">static </span><span>size_t </span><span style="color:#8fa1b3;">callNumTrailingObjects</span><span>(</span><span style="color:#b48ead;">const</span><span> BaseTy *</span><span style="color:#bf616a;">Obj</span><span>,
+</span><span>                                       TrailingObjectsBase::OverloadToken&lt;T&gt;) {
+</span><span>    </span><span style="color:#b48ead;">return</span><span> Obj-&gt;</span><span style="color:#bf616a;">numTrailingObjects</span><span>(TrailingObjectsBase::</span><span style="color:#bf616a;">OverloadToken</span><span>&lt;T&gt;());
+</span><span>  }
+</span></code></pre>
+<p>这里是用到了 <code>BaseTy</code> 这个参数，在 <code>TargetStructDescriptor</code> 的使用场景中 <code>BaseTy</code> 为 <code>TargetStructDescriptor&lt;Runtime&gt;</code>，而 <code>TargetStructDescriptor</code> 继承自 <code>TrailingObjects</code>，这种手法叫 <a href="https://en.wikipedia.org/wiki/Curiously_recurring_template_pattern">CRTP</a>，即父类通过模板参数感知子类，从而实现编译期多态。在这个例子中，<code>callNumTrailingObjects</code> 调用到 <code>TargetStructDescriptor</code> 中的 <code>numTrailingObjects</code> 实现，实现不同类型的自定义行为：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TargetStructDescriptor </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">  size_t </span><span style="color:#8fa1b3;">numTrailingObjects</span><span style="color:#eff1f5;">(OverloadToken&lt;ForeignMetadataInitialization&gt;) </span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">-&gt;</span><span style="color:#bf616a;">hasForeignMetadataInitialization</span><span style="color:#eff1f5;">() </span><span>? </span><span style="color:#d08770;">1 </span><span>: </span><span style="color:#d08770;">0</span><span style="color:#eff1f5;">;
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  size_t </span><span style="color:#8fa1b3;">numTrailingObjects</span><span style="color:#eff1f5;">(OverloadToken&lt;SingletonMetadataInitialization&gt;) </span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">-&gt;</span><span style="color:#bf616a;">hasSingletonMetadataInitialization</span><span style="color:#eff1f5;">() </span><span>? </span><span style="color:#d08770;">1 </span><span>: </span><span style="color:#d08770;">0</span><span style="color:#eff1f5;">;
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  size_t </span><span style="color:#8fa1b3;">numTrailingObjects</span><span style="color:#eff1f5;">(OverloadToken&lt;MetadataListCount&gt;) </span><span style="color:#b48ead;">const </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">-&gt;</span><span style="color:#bf616a;">hasCanonicicalMetadataPrespecializations</span><span style="color:#eff1f5;">() </span><span>?
+</span><span style="color:#eff1f5;">      </span><span style="color:#d08770;">1
+</span><span style="color:#eff1f5;">      </span><span>: </span><span style="color:#d08770;">0</span><span style="color:#eff1f5;">;
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  size_t </span><span style="color:#8fa1b3;">numTrailingObjects</span><span style="color:#eff1f5;">(OverloadToken&lt;MetadataListEntry&gt;) </span><span style="color:#b48ead;">const </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">-&gt;</span><span style="color:#bf616a;">hasCanonicicalMetadataPrespecializations</span><span style="color:#eff1f5;">() </span><span>?
+</span><span style="color:#eff1f5;">      </span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">-&gt;</span><span style="color:#b48ead;">template </span><span style="color:#bf616a;">getTrailingObjects</span><span style="color:#eff1f5;">&lt;MetadataListCount&gt;()-&gt;</span><span style="color:#bf616a;">count
+</span><span style="color:#eff1f5;">      </span><span>: </span><span style="color:#d08770;">0</span><span style="color:#eff1f5;">;
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<h3 id="yong-fa-fen-xi-xiao-jie">用法分析 &amp; 小结</h3>
+<p>到这里我们就可以分析一下 <code>TrailingObjects</code> 的作用了。首先整个 <code>TrailingObjects</code> 继承链中没有任何存储字段，因此当一个类型继承它是不会更改内存布局。然后来看一下 <code>getTrailingObjects</code> 方法的逻辑，假设对于 <code>TrailingObjects&lt;Base, A, B&gt;</code> 调用 <code>getTrailingObjects&lt;B&gt;()</code>，其调用过程为：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>getTrailingObjects&lt;B&gt;()
+</span><span>= getTrailingObjectsImpl&lt;B&gt;()
+</span><span>= getTrailingObjectsImpl(A) + callNumTrailingObjects(A)
+</span><span>= (A*)(getTrailingObjectsImpl(Base) + callNumTrailingObjects(Base)) + callNumTrailingObjects(A)
+</span></code></pre>
+<p>可以得出 <code>TrailingObjects</code> 作用的结构内存布局为：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>+------+------------+------------+
+</span><span>| Base | A * num(A) | B * num(B) |
+</span><span>+------+------------+------------+
+</span></code></pre>
+<p>这与 Swift ABI 约定的 Metadata 在二进制中的布局一致，通过 <code>TrailingObjects</code> 我们可以自由地声明类型的内存映射，在顺序和数量上的调整更加灵活。相比于简单的指针偏移计算，它能够提供更强的类型安全性，并且能够复用大部分计算逻辑，减少代码错误。</p>
+<p>当然这种结构也有一些不大不小的缺点，比如会让代码看起来更晦涩，不太容易看出类型的真实结构；另一方面，受制于 C++ 编译器的优化能力，模板 + 非尾递归的代码不能被优化为简单的表达式计算（尽管它在运行时做的确实就是一个简单的表达式计算），在运行效率上可能有一定开销，至少方法调用是真实存在的：</p>
+<p><img src="/images/swift-runtime-trailing-objects/5.png" alt="bt" /></p>
+<h2 id="zong-jie">总结</h2>
+<p>本文通过对 <code>TrailingObjects</code> 的分析，用具体例子介绍了自己在 Swift Runtime 的调试和源码阅读上的思路。相比 Objective-C Runtime，Swift Runtime 在复杂度和抽象程度上会更上一层，不过好在调试相对更容易。</p>
+<p>希望本文对大家可以起到抛砖引玉的作用。</p>
+<h2 id="xiang-guan-lian-jie">相关链接</h2>
+<ol>
+<li><a href="https://swift.org/blog/abi-stability-and-more/">ABI Stability and More</a></li>
+<li><a href="https://github.com/apple/swift/blob/e65ae80172ade4120ef51c100e1a69026866936e/include/swift/ABI/TrailingObjects.h">TrailingObjects.h</a></li>
+<li><a href="https://github.com/apple/swift/blob/e65ae80172ade4120ef51c100e1a69026866936e/include/swift/ABI/Metadata.h">Metadata.h</a></li>
+<li><a href="https://en.cppreference.com/w/cpp/language/partial_specialization">Partial template specialization - cppreference.com</a></li>
+<li><a href="https://zhuanlan.zhihu.com/p/129329663">C++ Compiler as a Brainfuck Interpreter</a></li>
+<li><a href="https://zhuanlan.zhihu.com/p/58179258">从源码解析 Swift 弱引用</a></li>
+</ol>
+
+        </div>
+
+        
+        <div class="post-separator"></div>
+        <p class="post-footnote">
+            * <strong>如果文章有任何问题，欢迎<a href="https://github.com/unixzii/unixzii.github.io/issues" target="_blank"">提交 Issues</a>，也可以<a href="/about">通过 Twitter 或邮箱联系我</a>。</strong>
+        </p>
+        </div>
+
+
+        
+        <footer class="footer">
+                <div class="copyright">
+                        <span>© 
+    2022
+ Cyandev</span>
+                        <span class="copyright-sep">::  </span>
+                        <span>Powered by <a href="https://www.getzola.org/">Zola</a></span>
+                    
+                </div>
+            </footer>
+        
+    </div>
+
+</div>
+</body>
+
+</html>

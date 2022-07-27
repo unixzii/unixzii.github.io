@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>Cyandev&#x27;s Blog</title>
+    
+    <meta http-equiv="content-type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+    <meta name="robots" content="noodp"/>
+
+    <link rel="stylesheet" href="https://unixzii.github.io/style.css">
+    <link rel="stylesheet" href="https://unixzii.github.io/color/orange.css">
+
+        <link rel="stylesheet" href="https://unixzii.github.io/color/background_blue.css">
+    
+    <link rel="stylesheet" href="https://unixzii.github.io/font-hack-subset.css">
+
+    </head>
+
+<body class="">
+<div class="container">
+    
+    
+
+    <aside class="aside">
+        <div class="adaptive-container">
+            <div class="aside__logo">
+                <!-- Customized logo area (will not be affected by config) -->
+                <strong>Cyandev's</strong>
+                <br>
+                <span style="font-weight: 100;">Blog</span>
+            </div>
+            <div class="aside__menu">
+                
+                    
+                <nav class="menu">
+            <ul class="menu__inner">
+                <li class="active"><a href="https://unixzii.github.io/">posts</a></li>
+            
+                <li><a href="https://unixzii.github.io//archive">archive</a></li>
+            
+                <li><a href="https://unixzii.github.io//tags">tags</a></li>
+            
+                <li><a href="https://unixzii.github.io//about">about</a></li>
+            </ul>
+        </nav>
+    
+    
+                
+            </div>
+        </div>
+    </aside>
+
+    <div class="content">
+        
+        <div class="posts">
+                <div class="post on-list">
+                    
+    <h1 class="post-title"><a href="https://unixzii.github.io/swift-runtime-protocol-dispatching/">深入 Swift Runtime 之 Protocol 方法派发的实现原理</a></h1>
+    <div class="post-meta-inline">
+        
+    <span class="post-date">
+            2021-12-08
+        </span>
+
+    </div>
+
+    
+        <span class="post-tags-inline">
+                :: tags:&nbsp;
+                <a class="post-tag" href="https://unixzii.github.io/tags/swift/">#swift</a>&nbsp;
+                <a class="post-tag" href="https://unixzii.github.io/tags/internals/">#internals</a></span>
+    
+
+                    
+        <div class="post-content">
+            <p>作为 iOS 开发者，我们都非常熟悉 Objective-C 的消息派发机制，围绕着这个机制也诞生了一系列“黑(miàn)魔(shì)法(tí)”。而到了 Swift 这边我们似乎还都在吃 OC 的老本，继续用着 <code>@objc</code> 来搞事。其实 Swift 在方法派发这件事上也做了很多底层的改变和优化，本文将以 Protocol 的视角来剖析一下 Swift 中的方法派发机制。</p>
+<h2 id="hui-gu-yi-xia-objc-msgsend">回顾一下 objc_msgSend</h2>
+<p>Objective-C 中的万物皆对象，不管是具体的类（如 <code>NSObject *</code>）还是 <code>id</code>，都具有类似的内存结构，即：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">union </span><span>isa_t {
+</span><span>    </span><span style="color:#8fa1b3;">isa_t</span><span>() { }
+</span><span>    </span><span style="color:#8fa1b3;">isa_t</span><span>(uintptr_t </span><span style="color:#bf616a;">value</span><span>) : </span><span style="color:#bf616a;">bits</span><span>(value) { }
+</span><span>
+</span><span>    Class cls;
+</span><span>    uintptr_t bits;
+</span><span style="color:#b48ead;">#if defined</span><span>(ISA_BITFIELD)
+</span><span>    </span><span style="color:#b48ead;">struct </span><span>{
+</span><span>        ISA_BITFIELD;  </span><span style="color:#65737e;">// defined in isa.h
+</span><span>    };
+</span><span style="color:#b48ead;">#endif
+</span><span>};
+</span><span>
+</span><span style="color:#b48ead;">struct </span><span>objc_object {
+</span><span style="color:#b48ead;">private</span><span>:
+</span><span>    isa_t isa;
+</span><span>
+</span><span>    </span><span style="color:#65737e;">// ivars...
+</span><span>};
+</span></code></pre>
+<p>而常规的方法调用（除 <code>objc_direct</code> 外）无一例外会走 <code>objc_msgSend</code> 的消息派发流程。因此在 Objective-C 中，是否为 protocol 不会决定方法派发的方式，只会影响编译时的一系列静态检查。</p>
+<p>关于 Objective-C 的消息派发机制本文就不过度展开了，有兴趣大家可以自己研究一下。</p>
+<h2 id="c-de-xu-fang-fa-ji-vtable">C++ 的虚方法及 vtable</h2>
+<p>在回到 Swift 之前我们再来看看另一个语言 C++ 是如何做方法派发的，这对理解 Swift 的机制也会有一定帮助和参考意义。</p>
+<p>C++ 对象的内存布局相比 Objective-C 对象的更加灵活，根据基类和成员方法的不同会有多种形态。当一个类为“标准布局类型”（<em>StandardLayoutType</em>）时，其内存布局与 C 中 struct 的内存布局一致。而当我们给类增加一个虚方法时，其内存布局就会发生变化，即在最前面增加了 <code> vtable</code> 指针。</p>
+<p>与 Objective-C 有一定区别的是，<code>vtable</code> 指针的赋值时机和 OC 对象 <code>isa</code> 的赋值时机不同。由于 OC 对象的构造是显式二段式，也就是 <code>alloc</code> 与 <code>init</code> 可以分开进行，一个对象在 <code>alloc</code> 之后就已经具有类型信息了（即 <code>isa</code> 已被初始化）。而 C++ 对象的构造是空间分配和初始化一体的，并且 C++ 支持 <strong>placement new</strong> 特性来将一个对象初始化到一个已经分配好的内存空间上，因此 C++ 在构造器中对 <code>vtable</code> 指针进行赋值。</p>
+<p>我们可以反编译下面的这个代码片段来验证这个过程：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">A </span><span style="color:#eff1f5;">{
+</span><span style="color:#b48ead;">public</span><span style="color:#eff1f5;">:
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">virtual void </span><span style="color:#8fa1b3;">foo</span><span style="color:#eff1f5;">() { }
+</span><span style="color:#eff1f5;">}</span><span>;
+</span><span>
+</span><span style="color:#b48ead;">int </span><span style="color:#8fa1b3;">main</span><span>() {
+</span><span>    A *a = </span><span style="color:#b48ead;">new</span><span> A;
+</span><span>    </span><span style="color:#b48ead;">return </span><span style="color:#d08770;">0</span><span>;
+</span><span>}
+</span></code></pre>
+<p>反编译结果如下：</p>
+<pre data-lang="asm" style="background-color:#2b303b;color:#c0c5ce;" class="language-asm "><code class="language-asm" data-lang="asm"><span style="color:#8fa1b3;">main:
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">push </span><span style="color:#bf616a;">rbp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov  </span><span style="color:#bf616a;">rbp</span><span>, </span><span style="color:#bf616a;">rsp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">sub  </span><span style="color:#bf616a;">rsp</span><span>, </span><span style="color:#d08770;">32
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov  </span><span style="color:#96b5b4;">dword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">4</span><span>], </span><span style="color:#d08770;">0
+</span><span>
+</span><span style="color:#65737e;">    ; A *a = new A;
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov  </span><span style="color:#bf616a;">edi</span><span>, </span><span style="color:#d08770;">8
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">call </span><span style="color:#8fa1b3;">operator new(unsigned long)
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov  </span><span style="color:#bf616a;">rdi</span><span>, </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov  </span><span style="color:#96b5b4;">qword </span><span style="color:#8fa1b3;">pttr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">24</span><span>], </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">call </span><span style="color:#8fa1b3;">A::A()</span><span style="color:#65737e;"> ; [base object constructor]
+</span><span>
+</span><span style="color:#65737e;">    ; ...
+</span></code></pre>
+<p>可以看到对象构造的两段过程，<code>operator new</code> 仅分配空间，接下来直接调用构造器：</p>
+<pre data-lang="asm" style="background-color:#2b303b;color:#c0c5ce;" class="language-asm "><code class="language-asm" data-lang="asm"><span style="color:#8fa1b3;">A::A():
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">push   </span><span style="color:#bf616a;">rbp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov    </span><span style="color:#bf616a;">rbp</span><span>, </span><span style="color:#bf616a;">rsp
+</span><span style="color:#8fa1b3;">    movabs </span><span style="color:#bf616a;">rax</span><span>, </span><span style="color:#8fa1b3;">offset vtable for A
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">add    </span><span style="color:#bf616a;">rax</span><span>, </span><span style="color:#d08770;">16
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov    </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">8</span><span>], </span><span style="color:#bf616a;">rdi
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov    </span><span style="color:#bf616a;">rcx</span><span>, </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">8</span><span>]
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov    </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rcx</span><span>], </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">pop    </span><span style="color:#bf616a;">rbp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">ret
+</span></code></pre>
+<p>此时 <code>rdi</code> 寄存器为 <code>this</code> 指针（即对象的地址），<code>vtable</code> 指针经过偏移后被赋给对象的首部空间。</p>
+<p>接下来来看方法派发的实现，我们直接反编译下面这段代码：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">A </span><span style="color:#eff1f5;">{
+</span><span style="color:#b48ead;">public</span><span style="color:#eff1f5;">:
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">virtual void </span><span style="color:#8fa1b3;">foo</span><span style="color:#eff1f5;">() </span><span>= </span><span style="color:#d08770;">0</span><span style="color:#eff1f5;">;
+</span><span style="color:#eff1f5;">}</span><span>;
+</span><span>
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">B </span><span style="color:#eff1f5;">{
+</span><span style="color:#b48ead;">public</span><span style="color:#eff1f5;">:
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">virtual void </span><span style="color:#8fa1b3;">bar</span><span style="color:#eff1f5;">() </span><span>= </span><span style="color:#d08770;">0</span><span style="color:#eff1f5;">;
+</span><span style="color:#eff1f5;">}</span><span>;
+</span><span>
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">C </span><span style="color:#eff1f5;">: </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">A</span><span style="color:#eff1f5;">, </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">B </span><span style="color:#eff1f5;">{
+</span><span style="color:#b48ead;">public</span><span style="color:#eff1f5;">:
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">virtual void </span><span style="color:#8fa1b3;">foo</span><span style="color:#eff1f5;">() { }
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">virtual void </span><span style="color:#8fa1b3;">bar</span><span style="color:#eff1f5;">() { }
+</span><span style="color:#eff1f5;">}</span><span>;
+</span><span>
+</span><span style="color:#b48ead;">int </span><span style="color:#8fa1b3;">main</span><span>() {
+</span><span>    C *c = </span><span style="color:#b48ead;">new</span><span> C;
+</span><span>    c-&gt;</span><span style="color:#bf616a;">bar</span><span>();  </span><span style="color:#65737e;">// 主要关注这里
+</span><span>    </span><span style="color:#b48ead;">return </span><span style="color:#d08770;">0</span><span>;
+</span><span>}
+</span></code></pre>
+<p>反编译结果如下：</p>
+<pre data-lang="asm" style="background-color:#2b303b;color:#c0c5ce;" class="language-asm "><code class="language-asm" data-lang="asm"><span style="color:#8fa1b3;">main:
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">push    </span><span style="color:#bf616a;">rbp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rbp</span><span>, </span><span style="color:#bf616a;">rsp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">sub     </span><span style="color:#bf616a;">rsp</span><span>, </span><span style="color:#d08770;">32
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#96b5b4;">dword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">4</span><span>], </span><span style="color:#d08770;">0
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">edi</span><span>, </span><span style="color:#d08770;">16
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">call    </span><span style="color:#8fa1b3;">operator new(unsigned long)
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rdi</span><span>, </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">24</span><span>], </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">call    </span><span style="color:#8fa1b3;">C::C() </span><span>[</span><span style="color:#8fa1b3;">base object constructor</span><span>]
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rax</span><span>, </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">24</span><span>]
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">16</span><span>], </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rcx</span><span>, </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">16</span><span>]</span><span style="color:#65737e;"> ; rcx 现在是 c 的指针
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rdx</span><span>, </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rcx</span><span>]</span><span style="color:#65737e;">      ; rdx 现在是 vtable 指针
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rdi</span><span>, </span><span style="color:#bf616a;">rcx
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">call    </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rdx </span><span>+ </span><span style="color:#d08770;">8</span><span>]</span><span style="color:#65737e;">       ; 调用 (vtable + 8) 地址指向的函数
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">xor     </span><span style="color:#bf616a;">eax</span><span>, </span><span style="color:#bf616a;">eax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">add     </span><span style="color:#bf616a;">rsp</span><span>, </span><span style="color:#d08770;">32
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">pop     </span><span style="color:#bf616a;">rbp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">ret
+</span></code></pre>
+<p>可以看到一次查表的过程，由于类 <code>C</code> 中包含虚方法，方法调用不能采用静态派发方式（为了实现多态），但与 Objective-C 不同的是这个查表过程非常简单，其实就是个数组访问的操作，因此它的性能也会比 Objective-C 的消息派发（查 cache / 遍历 method list）快上很多倍。</p>
+<p>但假如这里我们稍微变换一下代码：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">int </span><span style="color:#8fa1b3;">main</span><span>() {
+</span><span>    B *b = </span><span style="color:#b48ead;">new</span><span> C;  </span><span style="color:#65737e;">// 变量类型从 C 改成了基类 B
+</span><span>    b-&gt;</span><span style="color:#bf616a;">bar</span><span>();
+</span><span>    </span><span style="color:#b48ead;">return </span><span style="color:#d08770;">0</span><span>;
+</span><span>}
+</span></code></pre>
+<p>再看反编译结果：</p>
+<pre data-lang="asm" style="background-color:#2b303b;color:#c0c5ce;" class="language-asm "><code class="language-asm" data-lang="asm"><span style="color:#8fa1b3;">main:
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">push    </span><span style="color:#bf616a;">rbp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rbp</span><span>, </span><span style="color:#bf616a;">rsp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">sub     </span><span style="color:#bf616a;">rsp</span><span>, </span><span style="color:#d08770;">32
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#96b5b4;">dword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">4</span><span>], </span><span style="color:#d08770;">0
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">edi</span><span>, </span><span style="color:#d08770;">16
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">call    </span><span style="color:#8fa1b3;">operator new(unsigned long)
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rdi</span><span>, </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">24</span><span>], </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">call    </span><span style="color:#8fa1b3;">C::C() </span><span>[</span><span style="color:#8fa1b3;">base object constructor</span><span>]
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">xor     </span><span style="color:#bf616a;">ecx</span><span>, </span><span style="color:#bf616a;">ecx
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">eax</span><span>, </span><span style="color:#bf616a;">ecx
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rdx</span><span>, </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">24</span><span>]
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">cmp     </span><span style="color:#bf616a;">rdx</span><span>, </span><span style="color:#d08770;">0
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">32</span><span>], </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">je      </span><span style="color:#8fa1b3;">.LBB0_2</span><span style="color:#65737e;">                   ; 这里有个判空保护，我们直接忽略这行
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rax</span><span>, </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">24</span><span>]
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">add     </span><span style="color:#bf616a;">rax</span><span>, </span><span style="color:#d08770;">8</span><span style="color:#65737e;">                    ; this 指针被偏移了 8，赋给 rax（记变量 b）
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">32</span><span>], </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">.LBB0_2:
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rax</span><span>, </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">32</span><span>]
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">16</span><span>], </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rax</span><span>, </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">16</span><span>]</span><span style="color:#65737e;"> ; rax 现在等于变量 b 的值
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rcx</span><span>, </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rax</span><span>]</span><span style="color:#65737e;">      ; 到这里就回到与上个例子相同的查表逻辑
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rdi</span><span>, </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">call    </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rcx</span><span>]
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">xor     </span><span style="color:#bf616a;">eax</span><span>, </span><span style="color:#bf616a;">eax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">add     </span><span style="color:#bf616a;">rsp</span><span>, </span><span style="color:#d08770;">32
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">pop     </span><span style="color:#bf616a;">rbp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">ret
+</span></code></pre>
+<p>改变了一下变量的类型，汇编代码竟然有这么大的变化。其实到后面大家就会发现 C++ 与 Swift 类似，会根据代码上下文的不同来改变生成的代码。原因也很简单，我们先来看 C++ 这个现象背后的原理。首先看一下类型 <code>C</code> 的构造器汇编代码：</p>
+<pre data-lang="asm" style="background-color:#2b303b;color:#c0c5ce;" class="language-asm "><code class="language-asm" data-lang="asm"><span style="color:#8fa1b3;">C::C() </span><span>[</span><span style="color:#8fa1b3;">base object constructor</span><span>]</span><span style="color:#8fa1b3;">:
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">push    </span><span style="color:#bf616a;">rbp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rbp</span><span>, </span><span style="color:#bf616a;">rsp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">sub     </span><span style="color:#bf616a;">rsp</span><span>, </span><span style="color:#d08770;">16
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">8</span><span>], </span><span style="color:#bf616a;">rdi
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rax</span><span>, </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">8</span><span>]
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rcx</span><span>, </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rdi</span><span>, </span><span style="color:#bf616a;">rcx
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">16</span><span>], </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">call    </span><span style="color:#8fa1b3;">A::A() </span><span>[</span><span style="color:#8fa1b3;">base object constructor</span><span>]</span><span style="color:#65737e;">  ; 调用 A 的构造器
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rax</span><span>, </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">16</span><span>]
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">add     </span><span style="color:#bf616a;">rax</span><span>, </span><span style="color:#d08770;">8
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rdi</span><span>, </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">call    </span><span style="color:#8fa1b3;">B::B() </span><span>[</span><span style="color:#8fa1b3;">base object constructor</span><span>]</span><span style="color:#65737e;">  ; 调用 B 的构造器
+</span><span style="color:#8fa1b3;">    movabs  </span><span style="color:#bf616a;">rax</span><span>, </span><span style="color:#8fa1b3;">offset vtable for C
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rcx</span><span>, </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">add     </span><span style="color:#bf616a;">rcx</span><span>, </span><span style="color:#d08770;">48
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">add     </span><span style="color:#bf616a;">rax</span><span>, </span><span style="color:#d08770;">16
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rdx</span><span>, </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">16</span><span>]
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rdx</span><span>], </span><span style="color:#bf616a;">rax
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rdx </span><span>+ </span><span style="color:#d08770;">8</span><span>], </span><span style="color:#bf616a;">rcx
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">add     </span><span style="color:#bf616a;">rsp</span><span>, </span><span style="color:#d08770;">16
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">pop     </span><span style="color:#bf616a;">rbp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">ret
+</span></code></pre>
+<p>由于每个类的构造器都会为那个类型设置 <code>vtable</code> 指针，因此类 <code>C</code> 的对象中会存在 2 个 <code>vtable</code> 指针（第一个被 <code>C</code> 自己的 <code>vtable</code> 指针覆盖了）！最开始的那里例子中，我们调用的是 <code>C::bar</code> 方法，由于接收类型是 <code>C</code>，因此查的也是 C 的 vtable，其内容如下：</p>
+<pre data-lang="asm" style="background-color:#2b303b;color:#c0c5ce;" class="language-asm "><code class="language-asm" data-lang="asm"><span style="color:#8fa1b3;">vtable for C:
+</span><span style="color:#8fa1b3;">    .quad   </span><span style="color:#d08770;">0
+</span><span style="color:#8fa1b3;">    .quad   typeinfo for C
+</span><span style="color:#8fa1b3;">    .quad   C::foo()
+</span><span style="color:#8fa1b3;">    .quad   C::bar()
+</span><span style="color:#8fa1b3;">    .quad   </span><span>-</span><span style="color:#d08770;">8
+</span><span style="color:#8fa1b3;">    .quad   typeinfo for C
+</span><span style="color:#8fa1b3;">    .quad   non</span><span>-</span><span style="color:#8fa1b3;">virtual thunk to C::bar()
+</span></code></pre>
+<p><code>C</code> 继承了 <code>A</code>、<code>B</code>，因此 <code>vtable for C</code> 是会向下兼容类 <code>A</code> 的 vtable 的（即把 <code>C*</code> 的值赋给 <code>A*</code> 变量与 <code>C*</code> 的值赋给 <code>C*</code> 变量是相同的）。这个特性可以使得一个固定方法在 vtable 中的 index 是固定的。比如调用 <code>C::bar</code>，查找 vtable 下标就是 1，不管其真实类型是什么。</p>
+<p>当我们将 <code>C*</code> 的值赋给 <code>B*</code> 的变量时，由于两者的 vtable 结构不兼容（很显然，<code>vtable for C</code> 和 <code>vtable for B</code> 的第一个函数指针不同），我们就不能不做任何处理地把原地址赋值过去，而是要偏移到兼容 <code>vtable for B</code> 的第二个 vtable 地址。这时当我们调用 <code>B::bar</code> 的时候，根据 vtable 内容，就会调用到 <code>non-virtual thunk to C::bar()</code> 函数中。</p>
+<p>这里画了一张图，方便大家理解：</p>
+<p><img src="/images/swift-runtime-protocol-dispatching/3.png" alt="" /></p>
+<h3 id="thunk-dao-di-shi-shi-yao">thunk 到底是什么？</h3>
+<p>看到这里你可能会发现了，这咋 <code>vtable for B</code> 的内容和 <code>vtable for C</code> 的还不一样呢？虽然我们的目的都是调用 <code>C::bar</code>，但是还记得上文说的对象指针偏移吗？由于 <code>C*</code> 赋给 <code>B*</code> 变量时指针发生了偏移，<code>C::bar</code> 拿到的 <code>this</code> 指针就不正确了。所以我们这里不能直接调用 <code>C::bar</code>，而是要先调用一个“跳板”函数，这就是所谓的 thunk。<strong>大家记住这个东西，后面我们分析 Swift 时还会遇到哦。</strong> 我们来看一下这个 thunk 所做的事情：</p>
+<pre data-lang="asm" style="background-color:#2b303b;color:#c0c5ce;" class="language-asm "><code class="language-asm" data-lang="asm"><span style="color:#8fa1b3;">non</span><span>-</span><span style="color:#8fa1b3;">virtual thunk to C::bar():
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">push    </span><span style="color:#bf616a;">rbp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rbp</span><span>, </span><span style="color:#bf616a;">rsp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">8</span><span>], </span><span style="color:#bf616a;">rdi
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rax</span><span>, </span><span style="color:#96b5b4;">qword ptr </span><span>[</span><span style="color:#bf616a;">rbp </span><span>- </span><span style="color:#d08770;">8</span><span>]
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">add     </span><span style="color:#bf616a;">rax</span><span>, -</span><span style="color:#d08770;">8
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">mov     </span><span style="color:#bf616a;">rdi</span><span>, </span><span style="color:#bf616a;">rax</span><span style="color:#65737e;">             ; 其实只是对 this 做了一次偏移
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">pop     </span><span style="color:#bf616a;">rbp
+</span><span style="color:#8fa1b3;">    </span><span style="color:#b48ead;">jmp     </span><span style="color:#8fa1b3;">C::bar()</span><span style="color:#65737e;">             ; 尾递归风格调用，不会产生新栈帧
+</span></code></pre>
+<p>所以 thunk 基本上就是对入参（通常是 <code>this</code>）进行一些调整，然后调用真正的函数继续执行。</p>
+<h2 id="back-to-swift">Back to Swift</h2>
+<p>上面我们简单回顾了一下 Objective-C 和 C++ 的方法派发机制，不是很完整，但相信大家能够大致理解其中的思路了。有了这些前置知识之后再来分析 Swift 的方法派发就会容易得多。</p>
+<p>但是在正式开始之前我们还是要再认识两个中间语言：SIL、LLVM IR。不像 C++，Swift 的反编译结果比较晦涩，原因一方面是 Swift ABI 结构相比 C++ 会更复杂一些；另一方面是 SIL 的存在会对 Swift 源码做一次去抽象（desugar、lowering），之后生成的 LLVM IR 又会对类 C 的操作做一次优化，最后得到的代码就比较难看出原貌了。因此本文分析 Swift 的时候不去看反汇编代码，而主要去看 LLVM IR，因为在这一层仍然能保留很多内存布局的信息，各种操作相比机器码也更易于理解。关于 SIL 和 LLVM IR，本文不过多展开，大家可以在阅读文章时找到对应的文档自行参考。</p>
+<h3 id="tong-guo-jing-tai-pai-fa-chu-shi-sil-llvm-ir">通过静态派发初识 SIL、LLVM IR</h3>
+<p>第一个例子我们先来看看 Swift 中的静态派发，考虑下面的代码：</p>
+<pre data-lang="swift" style="background-color:#2b303b;color:#c0c5ce;" class="language-swift "><code class="language-swift" data-lang="swift"><span style="color:#b48ead;">protocol</span><span> SomeRegularProtocol {
+</span><span>    </span><span style="color:#b48ead;">func </span><span>methodA(_ x: Int) -&gt; Int
+</span><span>}
+</span><span>
+</span><span>struct SomeImpl: SomeRegularProtocol {
+</span><span>
+</span><span>    </span><span style="color:#b48ead;">let</span><span> data: Int
+</span><span>
+</span><span>    </span><span style="color:#b48ead;">func </span><span>methodA(_ x: Int) -&gt; Int {
+</span><span>        </span><span style="color:#b48ead;">return</span><span> data + x
+</span><span>    }
+</span><span>
+</span><span>}
+</span><span>
+</span><span style="color:#b48ead;">let</span><span> impl = SomeImpl(data: </span><span style="color:#d08770;">1024</span><span>)
+</span><span>impl.methodA(</span><span style="color:#d08770;">42</span><span>)
+</span></code></pre>
+<p>由于 struct 不能继承，使用时均是值类型，因此调用的方法地址一定是确定的，我们来分别看看 SIL 和 LLVM IR：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>// SIL
+</span><span>// main
+</span><span>sil @main : $@convention(c) (Int32, UnsafeMutablePointer&lt;Optional&lt;UnsafeMutablePointer&lt;Int8&gt;&gt;&gt;) -&gt; Int32 {
+</span><span>bb0(%0 : $Int32, %1 : $UnsafeMutablePointer&lt;Optional&lt;UnsafeMutablePointer&lt;Int8&gt;&gt;&gt;):
+</span><span>  alloc_global @$s4main4implAA8SomeImplVvp        // id: %2
+</span><span>  %3 = global_addr @$s4main4implAA8SomeImplVvp : $*SomeImpl // users: %10, %9
+</span><span>  %4 = metatype $@thin SomeImpl.Type              // user: %8
+</span><span>  %5 = integer_literal $Builtin.Int64, 1024       // user: %6
+</span><span>  %6 = struct $Int (%5 : $Builtin.Int64)          // user: %8
+</span><span>  // function_ref SomeImpl.init(data:)
+</span><span>  %7 = function_ref @$s4main8SomeImplV4dataACSi_tcfC : $@convention(method) (Int, @thin SomeImpl.Type) -&gt; SomeImpl // user: %8
+</span><span>  %8 = apply %7(%6, %4) : $@convention(method) (Int, @thin SomeImpl.Type) -&gt; SomeImpl // user: %9
+</span><span>  store %8 to %3 : $*SomeImpl                     // id: %9
+</span><span>  %10 = load %3 : $*SomeImpl                      // user: %14
+</span><span>  %11 = integer_literal $Builtin.Int64, 42        // user: %12
+</span><span>  %12 = struct $Int (%11 : $Builtin.Int64)        // user: %14
+</span><span>  // &gt;&gt;&gt;&gt; 这里要调用方法了 &lt;&lt;&lt;&lt;
+</span><span>  // function_ref SomeImpl.methodA(_:)
+</span><span>  %13 = function_ref @$s4main8SomeImplV7methodAyS2iF : $@convention(method) (Int, SomeImpl) -&gt; Int // user: %14
+</span><span>  %14 = apply %13(%12, %10) : $@convention(method) (Int, SomeImpl) -&gt; Int
+</span><span>  %15 = integer_literal $Builtin.Int32, 0         // user: %16
+</span><span>  %16 = struct $Int32 (%15 : $Builtin.Int32)      // user: %17
+</span><span>  return %16 : $Int32                             // id: %17
+</span><span>} // end sil function &#39;main&#39;
+</span></code></pre>
+<p>从 SIL 上就能看出对 <code>SomeImpl.methodA(_:)</code> 的调用就是直接拿到对应方法的函数指针，然后直接调用过去。这里提一下 <code>@convention(method)</code> 这个标注，它会指定一个方法的调用规约（<a href="https://en.wikipedia.org/wiki/Calling_convention">Calling Convention</a>），这里 <code>method</code> 其实与常规的 <code>System V ABI</code> 差不多，只不过规定了第一个参数是 <code>self</code> 指针。但需要注意的是，SIL 里体现的并不一定是真实的操作，到 LLVM IR 这一层之前仍然会有很多优化，我们来看看上面代码到 LLVM IR 后的结果：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>define i32 @main(i32 %0, i8** %1) #0 {
+</span><span>entry:
+</span><span>  %2 = bitcast i8** %1 to i8*
+</span><span>  %3 = call swiftcc i64 @&quot;$s4main8SomeImplV4dataACSi_tcfC&quot;(i64 1024)
+</span><span>  store i64 %3, i64* getelementptr inbounds (%T4main8SomeImplV, %T4main8SomeImplV* @&quot;$s4main4implAA8SomeImplVvp&quot;, i32 0, i32 0, i32 0), align 8
+</span><span>  %4 = load i64, i64* getelementptr inbounds (%T4main8SomeImplV, %T4main8SomeImplV* @&quot;$s4main4implAA8SomeImplVvp&quot;, i32 0, i32 0, i32 0), align 8
+</span><span>  // 直接调用对应方法，但注意入参
+</span><span>  %5 = call swiftcc i64 @&quot;$s4main8SomeImplV7methodAyS2iF&quot;(i64 42, i64 %4)
+</span><span>  ret i32 0
+</span><span>}
+</span></code></pre>
+<p>可以看到 LLVM IR 的代码比 SIL 简单了很多，很多无用操作会被优化掉。同时我们会发现 <code>SomeImpl.methodA(_:)</code> 方法的入参发生了变化，第二个参数是一个 <code>Int</code>，这也是编译期做的优化，因为这个方法并不需要完整的结构体内容，仅传入需要的数据可以减少拷贝开销。</p>
+<h3 id="protocol-fang-fa-diao-yong-de-shi-xian-yuan-li">Protocol 方法调用的实现原理</h3>
+<p>上面的代码里我们声明了一个 <code>protocol</code>，在正常使用结构体的时候我们没有看到任何动态派发的过程，那我们用 <code>protocol</code> 的方式调用一下看看，首先修改一下代码：</p>
+<pre data-lang="swift" style="background-color:#2b303b;color:#c0c5ce;" class="language-swift "><code class="language-swift" data-lang="swift"><span style="color:#65737e;">// ...
+</span><span style="color:#b48ead;">func </span><span>useRegularProtocol(_ p: SomeRegularProtocol) {
+</span><span>    </span><span style="color:#b48ead;">let</span><span> _ = p.methodA(</span><span style="color:#d08770;">42</span><span>)
+</span><span>}
+</span><span>
+</span><span style="color:#b48ead;">let</span><span> impl = SomeImpl(data: </span><span style="color:#d08770;">1024</span><span>)
+</span><span>useRegularProtocol(impl)
+</span></code></pre>
+<p>然后我们来看一下 SIL：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>// main
+</span><span>sil @main : $@convention(c) (Int32, UnsafeMutablePointer&lt;Optional&lt;UnsafeMutablePointer&lt;Int8&gt;&gt;&gt;) -&gt; Int32 {
+</span><span>bb0(%0 : $Int32, %1 : $UnsafeMutablePointer&lt;Optional&lt;UnsafeMutablePointer&lt;Int8&gt;&gt;&gt;):
+</span><span>  alloc_global @$s4main4implAA8SomeImplVvp        // id: %2
+</span><span>  %3 = global_addr @$s4main4implAA8SomeImplVvp : $*SomeImpl // users: %11, %9
+</span><span>  %4 = metatype $@thin SomeImpl.Type              // user: %8
+</span><span>  %5 = integer_literal $Builtin.Int64, 1024       // user: %6
+</span><span>  %6 = struct $Int (%5 : $Builtin.Int64)          // user: %8
+</span><span>  // function_ref SomeImpl.init(data:)
+</span><span>  %7 = function_ref @$s4main8SomeImplV4dataACSi_tcfC : $@convention(method) (Int, @thin SomeImpl.Type) -&gt; SomeImpl // user: %8
+</span><span>  %8 = apply %7(%6, %4) : $@convention(method) (Int, @thin SomeImpl.Type) -&gt; SomeImpl // user: %9
+</span><span>  store %8 to %3 : $*SomeImpl                     // id: %9
+</span><span>
+</span><span>  // 以上都没什么区别
+</span><span>  // 这里开辟了一个存放 protocol 变量的空间
+</span><span>  %10 = alloc_stack $SomeRegularProtocol          // users: %17, %16, %15, %12
+</span><span>  %11 = load %3 : $*SomeImpl                      // user: %13
+</span><span>  // 做了一个奇怪操作，一会着重看一下
+</span><span>  %12 = init_existential_addr %10 : $*SomeRegularProtocol, $SomeImpl // user: %13
+</span><span>  store %11 to %12 : $*SomeImpl                   // id: %13
+</span><span>  // function_ref useRegularProtocol(_:)
+</span><span>  // 直接调用我们的 useRegularProtocol 方法
+</span><span>  %14 = function_ref @$s4main18useRegularProtocolyyAA04SomecD0_pF : $@convention(thin) (@in_guaranteed SomeRegularProtocol) -&gt; () // user: %15
+</span><span>  %15 = apply %14(%10) : $@convention(thin) (@in_guaranteed SomeRegularProtocol) -&gt; ()
+</span><span>  destroy_addr %10 : $*SomeRegularProtocol        // id: %16
+</span><span>  dealloc_stack %10 : $*SomeRegularProtocol       // id: %17
+</span><span>  %18 = integer_literal $Builtin.Int32, 0         // user: %19
+</span><span>  %19 = struct $Int32 (%18 : $Builtin.Int32)      // user: %20
+</span><span>  return %19 : $Int32                             // id: %20
+</span><span>} // end sil function &#39;main&#39;
+</span></code></pre>
+<p>上面我们遇到了一个新指令：<code>init_existential_addr</code>。不知道是什么，我们查一下 SIL 文档：</p>
+<blockquote>
+<p>Partially initializes the memory referenced by <code>%0</code> with an existential container prepared to contain a value of type <code>$T</code>. The result of the instruction is an address referencing the storage for the contained value, which remains uninitialized. The contained value must be <code>store</code>-d or <code>copy_addr</code>-ed to in order for the existential value to be fully initialized. If the existential container needs to be destroyed while the contained value is uninitialized, <a href="https://github.com/apple/swift/blob/main/docs/SIL.rst#deinit-existential-addr">deinit_existential_addr</a> must be used to do so. A fully initialized existential container can be destroyed with <a href="https://github.com/apple/swift/blob/main/docs/SIL.rst#destroy-addr">destroy_addr</a> as usual. It is undefined behavior to <a href="https://github.com/apple/swift/blob/main/docs/SIL.rst#destroy-addr">destroy_addr</a> a partially-initialized existential container.</p>
+</blockquote>
+<h4 id="existential-container">Existential Container</h4>
+<p>这里又出现了一个新概念：<strong>Existential Container</strong>。这个概念大家如果熟悉 Swift 的话应该或多或少听说过，简单来讲它就是一个存放任意类型的变量，你可以把它理解为 <code>Any</code>。为了做到这一点，Swift 在运行时需要知道这个变量的<strong>存储数据（结构体、类本身）</strong>、<strong>类型</strong>、<strong>一系列特征值</strong>。这三要素缺一不可，存储数据好理解，大家可能会问为什么需要类型信息呢？因为 Swift 的 <code>struct</code> 是非常朴素的，它在内存布局中完全无法体现类型信息，如果不是编译时插入了什么上下文信息，我们在运行时拿到一个指向 <code>struct</code> 的地址是不能解析出它的类型名等信息的。而后面的一系列特征值则是我们通常讲的 <strong>witness tables</strong>，分为 <strong>protocol witness table</strong> 和 <strong>value witness table</strong>。他们在 protocol 方法派发过程中起到了至关重要的作用。</p>
+<p>Swift 的 ABI 稳定后 <strong>Existential Container</strong> 的内存布局不会发生变化，可以用 C 代码表示为：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>struct OpaqueExistentialContainer {
+</span><span>  void *fixedSizeBuffer[3];
+</span><span>  Metadata *type;
+</span><span>  WitnessTable *witnessTables[NUM_WITNESS_TABLES];
+</span><span>};
+</span></code></pre>
+<p>其中 <code>fixedSizeBuffer</code> 存放了 <code>struct</code> 的数据，如果 3 * 8 = 24 个字节放不下会转移到堆内存去，这个机制与 C++ 的 <code>std::string</code> 实现很像，属于 <a href="https://akrzemi1.wordpress.com/2014/04/14/common-optimizations/"><strong>SBO</strong></a> 优化。</p>
+<p>另外 <strong>Existential Container</strong> 还有一个变种版本，如果确定一个 <code>protocol</code> 一定是 <code>class</code> 类型时，它的内存布局会变成：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>struct ClassExistentialContainer {
+</span><span>  HeapObject *value;
+</span><span>  WitnessTable *witnessTables[NUM_WITNESS_TABLES];
+</span><span>};
+</span></code></pre>
+<p>因为 <code>class</code> 对象的内存布局里一定有 <code>Metadata</code> 信息。</p>
+<p>到这里其实我们就可以看一下上面那段代码转成 LLVM IR 的结果了（代码很长，你忍一下）：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>define i32 @main(i32 %0, i8** %1) #0 {
+</span><span>entry:
+</span><span>  // 这里已经为 protocol 变量分配栈空间了
+</span><span>  %2 = alloca %T4main19SomeRegularProtocolP, align 8
+</span><span>  %3 = bitcast i8** %1 to i8*
+</span><span>  %4 = call swiftcc i64 @&quot;$s4main8SomeImplV4dataACSi_tcfC&quot;(i64 1024)
+</span><span>  store i64 %4, i64* getelementptr inbounds (%T4main8SomeImplV, %T4main8SomeImplV* @&quot;$s4main4implAA8SomeImplVvp&quot;, i32 0, i32 0, i32 0), align 8
+</span><span>
+</span><span>  // 开始为 Existential Container 赋值
+</span><span>  %5 = bitcast %T4main19SomeRegularProtocolP* %2 to i8*
+</span><span>  call void @llvm.lifetime.start.p0i8(i64 40, i8* %5)
+</span><span>  // 注意：%6 是 SomeImpl.data 的值，这里没有立即使用
+</span><span>  %6 = load i64, i64* getelementptr inbounds (%T4main8SomeImplV, %T4main8SomeImplV* @&quot;$s4main4implAA8SomeImplVvp&quot;, i32 0, i32 0, i32 0), align 8
+</span><span>  // %7 是指向 type 的地址，紧接着的 store 指令为其赋了 SomeImpl 的 Metadata
+</span><span>  %7 = getelementptr inbounds %T4main19SomeRegularProtocolP, %T4main19SomeRegularProtocolP* %2, i32 0, i32 1
+</span><span>  store %swift.type* bitcast (i64* getelementptr inbounds (&lt;{ i8**, i64, &lt;{ i32, i32, i32, i32, i32, i32, i32 }&gt;*, i32, [4 x i8] }&gt;, &lt;{ i8**, i64, &lt;{ i32, i32, i32, i32, i32, i32, i32 }&gt;*, i32, [4 x i8] }&gt;* @&quot;$s4main8SomeImplVMf&quot;, i32 0, i32 1) to %swift.type*), %swift.type** %7, align 8
+</span><span>  // %8 是 witnessTables 指向的地址，紧接着的 store 指令为其赋值
+</span><span>  %8 = getelementptr inbounds %T4main19SomeRegularProtocolP, %T4main19SomeRegularProtocolP* %2, i32 0, i32 2
+</span><span>  store i8** getelementptr inbounds ([2 x i8*], [2 x i8*]* @&quot;$s4main8SomeImplVAA0B15RegularProtocolAAWP&quot;, i32 0, i32 0), i8*** %8, align 8
+</span><span>
+</span><span>  // 开始为 fixedSizeBuffer 赋值，由于空间足够，这里采用 inline 模式
+</span><span>  %10 = getelementptr inbounds %T4main19SomeRegularProtocolP, %T4main19SomeRegularProtocolP* %2, i32 0, i32 0
+</span><span>  %11 = bitcast [24 x i8]* %10 to %T4main8SomeImplV*
+</span><span>  %.data = getelementptr inbounds %T4main8SomeImplV, %T4main8SomeImplV* %11, i32 0, i32 0
+</span><span>  %.data._value = getelementptr inbounds %TSi, %TSi* %.data, i32 0, i32 0
+</span><span>  store i64 %6, i64* %.data._value, align 8
+</span><span>  // 赋值完毕
+</span><span>
+</span><span>  // 直接调用 useRegularProtocol 方法
+</span><span>  call swiftcc void @&quot;$s4main18useRegularProtocolyyAA04SomecD0_pF&quot;(%T4main19SomeRegularProtocolP* noalias nocapture dereferenceable(40) %2)
+</span><span>  %12 = bitcast %T4main19SomeRegularProtocolP* %2 to %__opaque_existential_type_1*
+</span><span>  call void @__swift_destroy_boxed_opaque_existential_1(%__opaque_existential_type_1* %12) #3
+</span><span>  %13 = bitcast %T4main19SomeRegularProtocolP* %2 to i8*
+</span><span>  call void @llvm.lifetime.end.p0i8(i64 40, i8* %13)
+</span><span>  ret i32 0
+</span><span>}
+</span></code></pre>
+<p>上面的代码就是 <code>init_existential_addr</code> 所表示的操作了，基本上跟我们的预想一样。到这里我们会发现，Swift 并不会像 C++ 那样，由于一个类定义了虚方法（实现 <code>protocol</code> 方法也算虚方法了），就为它立即生成一个 vtable 并伴随对象生命周期。Swift 将这个过程 defer 到 casting 的时机了，也就是说只有当我们把 <code>SomeImpl</code> 当作 <code>protocol</code> 或 <code>Any</code> 去用的时候才会生成对应的 witness tables，否则这部分开销就不需要。并且生成的 witness tables 不像 C++ 的 vtable 包含了所有的方法，而只会包含对应 protocol 需要的方法。如果你去 demangle pwt 的符号名，会得到 <code>protocol witness table for main.SomeImpl : main.SomeRegularProtocol in main</code>，也就是说这个 pwt 就是 X 类型实现 Y 协议专用的。</p>
+<h4 id="value-witness-table">Value Witness Table</h4>
+<p>除了 pwt 以外还存在着 vwt，前者与 protocol 相关，而后者则与任何 <code>Existential Container</code> 都有关。想象一下，当一个 <code>Any</code> 变量退出作用域时会发生什么。</p>
+<p>对于引用类型而言，退出作用域需要减少引用计数；而对于 <code>struct</code> 而言这里就要分情况讨论一下，有引用类型成员的 <code>struct</code> 需要对这些成员做引用计数减少，没有引用类型成员的 <code>struct</code> 则只需要释放内存空间即可。一个 <code>Any</code> 变量如何确定自己执行释放、拷贝等操作时应该做什么，这就取决于 <strong>Value Withness Table</strong>。</p>
+<p>这里我们用一个简单的例子展示一下 vwt 的使用场景，就不过多展开了：</p>
+<pre data-lang="swift" style="background-color:#2b303b;color:#c0c5ce;" class="language-swift "><code class="language-swift" data-lang="swift"><span style="color:#b48ead;">struct</span><span> SomeImpl: SomeRegularProtocol {
+</span><span>    </span><span style="color:#b48ead;">let</span><span> obj = NSObject()
+</span><span>}
+</span><span>
+</span><span style="color:#b48ead;">func </span><span>test() {
+</span><span>    </span><span style="color:#b48ead;">let</span><span> p: SomeRegularProtocol = SomeImpl(data: </span><span style="color:#d08770;">42</span><span>)
+</span><span>}
+</span></code></pre>
+<p>IR 如下：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>define hidden swiftcc void @&quot;$s4main4testyyF&quot;() #0 {
+</span><span>entry:
+</span><span>  %0 = alloca %T4main19SomeRegularProtocolP, align 8
+</span><span>  %1 = bitcast %T4main19SomeRegularProtocolP* %0 to i8*
+</span><span>  // 此处省略 10 多行...
+</span><span>  %10 = bitcast %T4main19SomeRegularProtocolP* %0 to %__opaque_existential_type_1*
+</span><span>  call void @__swift_destroy_boxed_opaque_existential_1(%__opaque_existential_type_1* %10) #2
+</span><span>  %11 = bitcast %T4main19SomeRegularProtocolP* %0 to i8*
+</span><span>  call void @llvm.lifetime.end.p0i8(i64 40, i8* %11)
+</span><span>  ret void
+</span><span>}
+</span></code></pre>
+<p>可以看到编译器在作用域退出时生成了 <code>__swift_destroy_boxed_opaque_existential_1</code> 调用，这个函数实际也是编译器合成的一个行数，我们可以看到它对应的代码：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>; Function Attrs: noinline nounwind
+</span><span>define linkonce_odr hidden void @__swift_destroy_boxed_opaque_existential_1(%__opaque_existential_type_1* %0) #9 {
+</span><span>entry:
+</span><span>  // %1 是类型的 Metadata
+</span><span>  %1 = getelementptr inbounds %__opaque_existential_type_1, %__opaque_existential_type_1* %0, i32 0, i32 1
+</span><span>  %2 = load %swift.type*, %swift.type** %1, align 8
+</span><span>  %3 = getelementptr inbounds %__opaque_existential_type_1, %__opaque_existential_type_1* %0, i32 0, i32 0
+</span><span>  %4 = bitcast %swift.type* %2 to i8***
+</span><span>  %5 = getelementptr inbounds i8**, i8*** %4, i64 -1
+</span><span>  // 从 Metadata 里取出 vwt
+</span><span>  %.valueWitnesses = load i8**, i8*** %5, align 8, !invariant.load !48, !dereferenceable !49
+</span><span>  %6 = bitcast i8** %.valueWitnesses to %swift.vwtable*
+</span><span>  %7 = getelementptr inbounds %swift.vwtable, %swift.vwtable* %6, i32 0, i32 10
+</span><span>  // 从 vwt 中取出 flags 字段（详见下文）
+</span><span>  %flags = load i32, i32* %7, align 8, !invariant.load !48
+</span><span>  %8 = and i32 %flags, 131072
+</span><span>  %flags.isInline = icmp eq i32 %8, 0
+</span><span>  br i1 %flags.isInline, label %inline, label %outline
+</span><span>
+</span><span>// 对象的存储数据以 inline 形式存放在 existential container 的 buffer 里
+</span><span>inline:                                           ; preds = %entry
+</span><span>  %9 = bitcast [24 x i8]* %3 to %swift.opaque*
+</span><span>  %10 = bitcast %swift.type* %2 to i8***
+</span><span>  %11 = getelementptr inbounds i8**, i8*** %10, i64 -1
+</span><span>  %.valueWitnesses1 = load i8**, i8*** %11, align 8, !invariant.load !48, !dereferenceable !49
+</span><span>  // 从 vwt 中取出 destroy 操作的函数地址
+</span><span>  %12 = getelementptr inbounds i8*, i8** %.valueWitnesses1, i32 1
+</span><span>  %13 = load i8*, i8** %12, align 8, !invariant.load !48
+</span><span>  %destroy = bitcast i8* %13 to void (%swift.opaque*, %swift.type*)*
+</span><span>  // 调用 destroy 函数
+</span><span>  call void %destroy(%swift.opaque* noalias %9, %swift.type* %2) #2
+</span><span>  ret void
+</span><span>
+</span><span>// 对象以 outline 形式分配在堆上，直接走引用计数 release 流程
+</span><span>outline:                                          ; preds = %entry
+</span><span>  %14 = bitcast [24 x i8]* %3 to %swift.refcounted**
+</span><span>  %15 = load %swift.refcounted*, %swift.refcounted** %14, align 8
+</span><span>  call void @swift_release(%swift.refcounted* %15) #2
+</span><span>  ret void
+</span><span>}
+</span></code></pre>
+<p>上面我们看到的 vwt 的数据结构在 Swift ABI 源码中均有体现，大家可以主要参考这个文件：<a href="https://github.com/apple/swift/blob/main/include/swift/ABI/Metadata.h#L334">Metadata.h:334</a></p>
+<p>顺便我们再看一下上面这个例子 vwt 里的函数吧，<code>SomeImpl</code> 的 vwt 内容如下：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>@&quot;$s4main8SomeImplVWV&quot; = internal constant %swift.vwtable {
+</span><span> i8* bitcast (%swift.opaque* ([24 x i8]*, [24 x i8]*, %swift.type*)* @&quot;$s4main8SomeImplVwCP&quot; to i8*),
+</span><span> i8* bitcast (void (%swift.opaque*, %swift.type*)* @&quot;$s4main8SomeImplVwxx&quot; to i8*),
+</span><span> i8* bitcast (%swift.opaque* (%swift.opaque*, %swift.opaque*, %swift.type*)* @&quot;$s4main8SomeImplVwcp&quot; to i8*),
+</span><span> i8* bitcast (%swift.opaque* (%swift.opaque*, %swift.opaque*, %swift.type*)* @&quot;$s4main8SomeImplVwca&quot; to i8*),
+</span><span> i8* bitcast (i8* (i8*, i8*, %swift.type*)* @__swift_memcpy16_8 to i8*),
+</span><span> i8* bitcast (%swift.opaque* (%swift.opaque*, %swift.opaque*, %swift.type*)* @&quot;$s4main8SomeImplVwta&quot; to i8*),
+</span><span> i8* bitcast (i32 (%swift.opaque*, i32, %swift.type*)* @&quot;$s4main8SomeImplVwet&quot; to i8*),
+</span><span> i8* bitcast (void (%swift.opaque*, i32, i32, %swift.type*)* @&quot;$s4main8SomeImplVwst&quot; to i8*),
+</span><span> i64 16, i64 16, i32 65543, i32 2147483647
+</span><span>}, align 8
+</span></code></pre>
+<p>其中 destroy 对应的函数是 <code>s4main8SomeImplVwxx</code>，其内容如下：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>; Function Attrs: nounwind
+</span><span>define internal void @&quot;$s4main8SomeImplVwxx&quot;(%swift.opaque* noalias %object, %swift.type* %SomeImpl) #10 {
+</span><span>entry:
+</span><span>  %0 = bitcast %swift.opaque* %object to %T4main8SomeImplV*
+</span><span>  %.obj = getelementptr inbounds %T4main8SomeImplV, %T4main8SomeImplV* %0, i32 0, i32 1
+</span><span>  %toDestroy = load %TSo8NSObjectC*, %TSo8NSObjectC** %.obj, align 8
+</span><span>  %1 = bitcast %TSo8NSObjectC* %toDestroy to i8*
+</span><span>  call void @llvm.objc.release(i8* %1)
+</span><span>  ret void
+</span><span>}
+</span></code></pre>
+<p>可以说是非常浅显易懂了。</p>
+<h4 id="thunk">thunk?</h4>
+<p>大家一定在调用栈中见过 <code>protocol witness for X in conformance Y</code> 这个奇怪方法，为什么有了 pwt 还需要一个跳板函数来调用真实的函数呢？</p>
+<p><img src="/images/swift-runtime-protocol-dispatching/4.png" alt="" /></p>
+<p>可以回想一下上文中提到的 C++ thunk 和 SIL 优化。回到 “通过静态派发初识 SIL、LLVM IR” 这一小节，Swift 的 struct 方法会有个成员内联的优化，也就是说方法参数中不会传入完整的 struct 对象，而只会传入所需要使用的成员。然而 protocol 调用时并不了解这一细节，调用方仍然需要将完整的 <code>self</code> 指针作为一个参数传入。这里编译器有两个选择：</p>
+<ol>
+<li>生成两份方法代码，分别适配直接调用和 protocol 调用</li>
+<li>生成跳板函数，在跳板函数中提取成员后调用原方法</li>
+</ol>
+<p>显然第二种方法更为高效。</p>
+<p>实际上 thunk 函数的作用还有很多，大家开发 OC 日常可能会用到的 Method Swizzling 也会用到类似 thunk 的技术，如果有兴趣也可以深入研究一下，还是非常有意思的。</p>
+<h2 id="zong-jie">总结</h2>
+<p>本文从 Objective-C、C++ 切入，以 SIL、LLVM IR 为“抓手”详细分析了 Swift Protocol 的方法派发原理，从中我们可以发现语言之间的很多共性，例如通过 thunk 来适配不同的调用方，通过函数表实现多态等。现代的很多编程语言实际上存在非常多相似的实现思路，比如 Golang 的 <code>interface{}</code> 也是用了跟 Swift Existential Container 一样的结构，只不过 Golang 称之为 <strong>fat pointer</strong>。通过这种方法能极大地减少堆内存的分配开销，使抽象的成本更低。</p>
+<p>同时我们也注意到了，相比 Objective-C 这门古老的语言，Swift 等现代语言会把更多的优化和底层实现放在编译期进行，减少运行时所需的信息，这也是为什么大家感觉在 Swift 里做反射这类操作更难了。其实不是 Swift 不存储元信息，只是 Apple 不再希望开发者通过运行时的特性来完成业务逻辑，开发者越依赖运行时信息，未来底层的优化机会就会越少。同理，G 家的 Flutter 也不允许开发者在 Dart 里使用反射，因为会影响 tree shaking 优化。Swift ABI 现在已经稳定，我们仍然可以在开发阶段借助运行时信息来做一些调试用途的事情。在实现业务逻辑上，还是应该优先选择编译期的解决方案。</p>
+
+        </div>
+
+                </div>
+            
+                <div class="post on-list">
+                    
+    <h1 class="post-title"><a href="https://unixzii.github.io/swift-runtime-trailing-objects/">深入 Swift Runtime 之 TrailingObjects</a></h1>
+    <div class="post-meta-inline">
+        
+    <span class="post-date">
+            2021-12-06
+        </span>
+
+    </div>
+
+    
+        <span class="post-tags-inline">
+                :: tags:&nbsp;
+                <a class="post-tag" href="https://unixzii.github.io/tags/swift/">#swift</a>&nbsp;
+                <a class="post-tag" href="https://unixzii.github.io/tags/internals/">#internals</a></span>
+    
+
+                    
+        <div class="post-content">
+            <p>Swift Runtime 底层结构和行为大量使用 C++ 开发，因此如果想要深入分析 Runtime 的原理或者 ABI 的内存布局等就需要对这部分 C++ 代码有所了解。Swift 的 C++ 源码中使用了很多“黑魔法”，尤其是模板，可能对 C++ 新手来说会比较劝退。本文就带大家深入浅出地分析其源码中的一个模板结构 <code>TrailingObjects</code>，揭开 Swift Runtime 的冰山一角。</p>
+<h2 id="jian-dan-liao-liao-swift-abi">简单聊聊 Swift ABI</h2>
+<p>据 Apple 称，自 Swift 5.0 起，其 ABI 在 Apple 平台上就稳定了，这意味着 Swift 5.0 的编译产物在内存布局、runtime 调用上就不会发生变化了，也意味着你可以更换任意一个 ABI 兼容的标准库（<code>libSwiftCore.dylib</code>）。因此在新的 iOS 版本中，app 就可以不将额外的 Swift Runtime 内嵌到 bundle 中了，从而节省了一部分包体积。</p>
+<p>ABI 的稳定也意味着我们可以直接更换编译好的可执行二进制产物的 Swift Runtime，并通过自己编译的 runtime 来调试其内部数据结构和行为。亦或者直接将 Swift Runtime 的头文件引入自己的工程中来调用（毕竟内存布局是一样的，所有的结构可以完全匹配上）。</p>
+<h2 id="ru-he-diao-shi-runtime">如何调试 Runtime</h2>
+<p>自己编译好 Swift 工具链后可以得到可调试的 <code>libSwiftCore.dylib</code>， 但直接 link 它的话在运行时还是会加在系统中的动态库，因为产物默认的 <code>LC_ID_DYLIB</code> 是系统路径，这里为了方便我们可以直接通过 <code>install_name_tool -change</code> 更换可执行的 <code>LC_LOAD_DYLIB</code> command，让它加载我们的 runtime。</p>
+<p><img src="/images/swift-runtime-trailing-objects/1.png" alt="otool" /></p>
+<p>更改好后我们在 runtime 代码里打一个断点，发现调试器可以成功断在里面并且可以随意访问变量和步进执行。</p>
+<p><img src="/images/swift-runtime-trailing-objects/2.png" alt="Xcode Breakpoints" /></p>
+<h2 id="ren-shi-di-yi-ge-runtime-jie-gou">认识第一个 Runtime 结构</h2>
+<p>Swift Runtime 中的数据结构很多，有运行时产生的，也有编译链接时产生的。我们这里来看一个编译时产生的重要结构：<code>Metadata</code>。它表示一个类型的元数据，runtime 的方方面面都依赖这个信息。在 Swift 中的表示为 <code>T.Type</code>，即 <code>T.self</code> 的返回值类型。我们可以通过反编译下面这个简单的代码片段来看一下它在运行时是怎么获取的：</p>
+<pre data-lang="Swift" style="background-color:#2b303b;color:#c0c5ce;" class="language-Swift "><code class="language-Swift" data-lang="Swift"><span style="color:#b48ead;">func </span><span>takeType&lt;T&gt;(_ t: T.</span><span style="color:#b48ead;">Type</span><span>) { }
+</span><span>
+</span><span>takeType(Foo.</span><span style="color:#b48ead;">self</span><span>)  </span><span style="color:#65737e;">// Line to decompile
+</span></code></pre>
+<p>反编译结果如下：</p>
+<p><img src="/images/swift-runtime-trailing-objects/3.png" alt="Hopper" /></p>
+<p>可以看到 takeType 的第一个参数为一个指针，指向了 <code>_$s4test3FooVMf</code> 这个符号加偏移量 8 的地址。这个符号 demangle 之后的符号名为 <code>full type metadata for test.Foo</code>，内容如下：</p>
+<p><img src="/images/swift-runtime-trailing-objects/4.png" alt="Hopper" /></p>
+<p>其 + 8 后的地址为另一个符号，但内容 hopper 无法解析。</p>
+<p>之前我们说过，<code>Metadata</code> 结构对应的 Swift 类型为 <code>T.Type</code>，那么这个 <code>_$s4test3FooVMf + 8</code> 的地址必然存放了与 <code>Metadata</code> 布局相同的内容。</p>
+<p>我们来看一下 <code>Metadata</code> 在 C++ 代码中的定义（已简化，完整代码链接也贴在了文章最后）：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> Runtime&gt; </span><span style="color:#b48ead;">struct </span><span>TargetMetadata;
+</span><span style="color:#b48ead;">using </span><span>Metadata = TargetMetadata&lt;InProcess&gt;;
+</span><span>
+</span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> Runtime&gt;
+</span><span style="color:#b48ead;">struct </span><span>TargetMetadata {
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredPointer = </span><span style="color:#b48ead;">typename</span><span> Runtime::StoredPointer;
+</span><span>
+</span><span>  </span><span style="color:#65737e;">/// The basic header type.
+</span><span>  </span><span style="color:#b48ead;">typedef</span><span> TargetTypeMetadataHeader&lt;Runtime&gt; HeaderType;
+</span><span>
+</span><span>  </span><span style="color:#b48ead;">constexpr </span><span style="color:#8fa1b3;">TargetMetadata</span><span>()
+</span><span>    : </span><span style="color:#bf616a;">Kind</span><span>(static_cast&lt;StoredPointer&gt;(MetadataKind::Class)) {}
+</span><span>  </span><span style="color:#b48ead;">constexpr </span><span style="color:#8fa1b3;">TargetMetadata</span><span>(MetadataKind </span><span style="color:#bf616a;">Kind</span><span>)
+</span><span>    : </span><span style="color:#bf616a;">Kind</span><span>(static_cast&lt;StoredPointer&gt;(Kind)) {}
+</span><span>
+</span><span style="color:#b48ead;">private</span><span>:
+</span><span>  </span><span style="color:#65737e;">/// The kind. Only valid for non-class metadata; getKind() must be used to get
+</span><span>  </span><span style="color:#65737e;">/// the kind value.
+</span><span>  StoredPointer Kind;
+</span><span style="color:#b48ead;">public</span><span>:
+</span><span>  </span><span style="color:#65737e;">/// Get the metadata kind.
+</span><span>  MetadataKind </span><span style="color:#8fa1b3;">getKind</span><span>() </span><span style="color:#b48ead;">const </span><span>{
+</span><span>    </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">getEnumeratedMetadataKind</span><span>(Kind);
+</span><span>  }
+</span><span>  
+</span><span>  </span><span style="color:#65737e;">/// Set the metadata kind.
+</span><span>  </span><span style="color:#b48ead;">void </span><span style="color:#8fa1b3;">setKind</span><span>(MetadataKind </span><span style="color:#bf616a;">kind</span><span>) {
+</span><span>    Kind = static_cast&lt;StoredPointer&gt;(kind);
+</span><span>  }
+</span><span>};
+</span></code></pre>
+<p>通过类型的定义可以看到，这个 <code>Metadata</code> 是 <code>TargetMetadata&lt;InProcess&gt;</code> 的 type-alias，为了方便我们后续都用 <code>Metadata</code> 代指后者。其存储字段只有一个 <code>StoredPointer</code> 类型的 <code>Kind</code> 变量。<code>StoredPointer</code> 定义在 Runtime 泛型中，代入 <code>InProcess</code> 可以看到定义（已简化）：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">struct </span><span>InProcess {
+</span><span>  </span><span style="color:#b48ead;">static constexpr </span><span>size_t PointerSize = sizeof(uintptr_t);
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredPointer = uintptr_t;
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredSignedPointer = uintptr_t;
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredSize = size_t;
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredPointerDifference = ptrdiff_t;
+</span><span>};
+</span></code></pre>
+<p>我们再来看下 MetadataKind 的定义：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">const unsigned</span><span> MetadataKindIsNonHeap = </span><span style="color:#d08770;">0x200</span><span>;
+</span><span>
+</span><span style="color:#b48ead;">enum class </span><span>MetadataKind : </span><span style="color:#a3be8c;">uint32_t </span><span>{
+</span><span style="color:#b48ead;">#define </span><span style="color:#8fa1b3;">METADATAKIND</span><span>(</span><span style="color:#bf616a;">name</span><span>, </span><span style="color:#bf616a;">value</span><span>) name = value,
+</span><span style="color:#b48ead;">#define </span><span style="color:#8fa1b3;">ABSTRACTMETADATAKIND</span><span>(</span><span style="color:#bf616a;">name</span><span>, </span><span style="color:#bf616a;">start</span><span>, </span><span style="color:#bf616a;">end</span><span>)                                 \
+</span><span>  name##_Start = start, name##_End = end,
+</span><span>  </span><span style="color:#65737e;">// content of: #include &quot;MetadataKind.def&quot;
+</span><span>  
+</span><span>  </span><span style="color:#b48ead;">#ifndef</span><span> NOMINALTYPEMETADATAKIND
+</span><span>	</span><span style="color:#b48ead;">#define </span><span style="color:#8fa1b3;">NOMINALTYPEMETADATAKIND</span><span>(</span><span style="color:#bf616a;">Name</span><span>, </span><span style="color:#bf616a;">Value</span><span>) </span><span style="color:#bf616a;">METADATAKIND</span><span>(Name, Value)
+</span><span>	</span><span style="color:#b48ead;">#endif
+</span><span>  
+</span><span>  </span><span style="color:#65737e;">/// A class type.
+</span><span>  </span><span style="color:#bf616a;">NOMINALTYPEMETADATAKIND</span><span>(Class, </span><span style="color:#d08770;">0</span><span>)
+</span><span>
+</span><span>  </span><span style="color:#65737e;">/// A struct type.
+</span><span>  </span><span style="color:#bf616a;">NOMINALTYPEMETADATAKIND</span><span>(Struct, </span><span style="color:#d08770;">0 </span><span>| MetadataKindIsNonHeap)
+</span><span>
+</span><span>  </span><span style="color:#65737e;">/// An enum type.
+</span><span>  </span><span style="color:#65737e;">/// If we add reference enums, that needs to go here.
+</span><span>  </span><span style="color:#bf616a;">NOMINALTYPEMETADATAKIND</span><span>(Enum, </span><span style="color:#d08770;">1 </span><span>| MetadataKindIsNonHeap)
+</span><span>  
+</span><span>  </span><span style="color:#65737e;">// ...
+</span><span>};
+</span><span>
+</span></code></pre>
+<p>刚才反编译看到的那段未知数据在内存布局上就与这个 <code>Kind</code> 对应，按值匹配即为 <code>Struct</code>。到这里大家可能就会好奇了，为什么 <code>_$s4test3FooVMf + 8</code> 才是 <code>Metadata</code> 呢，那 <code>_$s4test3FooVMf</code> 对应的是什么呢？这里先不展开，相信大家按照本文的思路也能自己找到它的定义。</p>
+<h2 id="metadata-zi-lei">Metadata 子类？</h2>
+<p>到这里我们已经正式将一个类型横跨 Swift - 二进制 - C++ 进行了对接，接下来我们就来继续分析其他的结构。通过 <code>Metadata</code> 的定义我们应该能猜到，它不可能承载所有的信息，那么不同类型的详细信息都在哪里呢？这就要引出它的“子类”们了。以本文分析的 struct 为例，其真实 <code>Metadata</code> 类型是 <code>StructMetadata</code> (aka. <code>TargetStructMetadata&lt;InProcess&gt;</code>)，结构定义及类型层次如下：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> Runtime&gt;
+</span><span style="color:#b48ead;">struct </span><span>TargetValueMetadata : </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">TargetMetadata</span><span>&lt;Runtime&gt; {
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredPointer = </span><span style="color:#b48ead;">typename</span><span> Runtime::StoredPointer;
+</span><span>  </span><span style="color:#8fa1b3;">TargetValueMetadata</span><span>(MetadataKind </span><span style="color:#bf616a;">Kind</span><span>,
+</span><span>                      </span><span style="color:#b48ead;">const</span><span> TargetTypeContextDescriptor&lt;Runtime&gt; *</span><span style="color:#bf616a;">description</span><span>)
+</span><span>      : </span><span style="color:#bf616a;">TargetMetadata</span><span>&lt;Runtime&gt;(Kind), </span><span style="color:#bf616a;">Description</span><span>(description) {}
+</span><span>
+</span><span>  </span><span style="color:#65737e;">/// An out-of-line description of the type.
+</span><span>  TargetSignedPointer&lt;Runtime, </span><span style="color:#b48ead;">const</span><span> TargetValueTypeDescriptor&lt;Runtime&gt; * __ptrauth_swift_type_descriptor&gt; Description;
+</span><span>};
+</span><span>
+</span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> Runtime&gt;
+</span><span style="color:#b48ead;">struct </span><span>TargetStructMetadata : </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">TargetValueMetadata</span><span>&lt;Runtime&gt; {
+</span><span>  </span><span style="color:#b48ead;">using </span><span>StoredPointer = </span><span style="color:#b48ead;">typename</span><span> Runtime::StoredPointer;
+</span><span>  </span><span style="color:#b48ead;">using</span><span> TargetValueMetadata&lt;Runtime&gt;::TargetValueMetadata;
+</span><span>
+</span><span>  </span><span style="color:#b48ead;">const</span><span> TargetStructDescriptor&lt;Runtime&gt; *</span><span style="color:#8fa1b3;">getDescription</span><span>() </span><span style="color:#b48ead;">const </span><span>{
+</span><span>    </span><span style="color:#b48ead;">return </span><span>llvm::</span><span style="color:#bf616a;">cast</span><span>&lt;TargetStructDescriptor&lt;Runtime&gt;&gt;(</span><span style="color:#bf616a;">this</span><span>-&gt;</span><span style="color:#bf616a;">Description</span><span>);
+</span><span>  }
+</span><span>
+</span><span>  </span><span style="color:#65737e;">/// Get a pointer to the field offset vector, if present, or null.
+</span><span>  </span><span style="color:#b48ead;">const </span><span>uint32_t *</span><span style="color:#8fa1b3;">getFieldOffsets</span><span>() </span><span style="color:#b48ead;">const </span><span>{
+</span><span>    </span><span style="color:#b48ead;">auto</span><span> offset = </span><span style="color:#bf616a;">getDescription</span><span>()-&gt;</span><span style="color:#bf616a;">FieldOffsetVectorOffset</span><span>;
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(offset == </span><span style="color:#d08770;">0</span><span>)
+</span><span>      </span><span style="color:#b48ead;">return </span><span style="color:#d08770;">nullptr</span><span>;
+</span><span>    </span><span style="color:#b48ead;">auto</span><span> asWords = reinterpret_cast&lt;</span><span style="color:#b48ead;">const void </span><span>* </span><span style="color:#b48ead;">const</span><span>*&gt;(</span><span style="color:#bf616a;">this</span><span>);
+</span><span>    </span><span style="color:#b48ead;">return </span><span>reinterpret_cast&lt;</span><span style="color:#b48ead;">const </span><span>uint32_t *&gt;(asWords + offset);
+</span><span>  }
+</span><span>};
+</span></code></pre>
+<p>可以看到 <code>StructMetadata</code> 本质上与 <code>ValueMetadata</code> 内存布局一致，仅当类型不同时有不同的运行时行为。<code>ValueMetadata</code> 在公共的 <code>Kind</code> 字段下又增加了 <code>Description</code> 字段，通过类型分析也是一个指针。这个字段指向了一个外联的描述结构，这个结构也是本文要重点分析的。</p>
+<h2 id="targetstructdescriptor">TargetStructDescriptor</h2>
+<p>先看定义：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> Runtime&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TargetStructDescriptor </span><span style="color:#b48ead;">final
+</span><span style="color:#eff1f5;">    : </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">TargetValueTypeDescriptor</span><span style="color:#eff1f5;">&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">      </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">TrailingGenericContextObjects</span><span style="color:#eff1f5;">&lt;TargetStructDescriptor&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">                            TargetTypeGenericContextDescriptorHeader,
+</span><span style="color:#eff1f5;">                            </span><span style="color:#65737e;">/*additional trailing objects*/
+</span><span style="color:#eff1f5;">                            TargetForeignMetadataInitialization&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">                            TargetSingletonMetadataInitialization&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">                            TargetCanonicalSpecializedMetadatasListCount&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">                            TargetCanonicalSpecializedMetadatasListEntry&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">                            TargetCanonicalSpecializedMetadatasCachingOnceToken&lt;Runtime&gt;&gt; {
+</span><span style="color:#eff1f5;">    </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<p>说实话，刚开始看到这个类型我也懵了一下，但实际并没有看上去那么复杂。我们来一点一点分析。</p>
+<p>首先第一个父类 <code>TargetValueTypeDescriptor</code>，它其实是一个很简单的类型，提供了一些公共字段和行为，继承关系如下：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>TargetValueTypeDescriptor
+</span><span>`-- TargetTypeContextDescriptor
+</span><span>    `-- TargetContextDescriptor
+</span></code></pre>
+<p>比较麻烦的是它的第二个父类 <code>TrailingGenericContextObjects&lt;&amp;@#?%^@*&gt;</code>，这个类型的模板参数很多且雷同，一看就是个 <em>variadic template</em>，我们还是直接看定义：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template</span><span>&lt;</span><span style="color:#b48ead;">class</span><span> Self,
+</span><span>         </span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span>&gt; </span><span style="color:#b48ead;">class</span><span> TargetGenericContextHeaderType =
+</span><span>           TargetGenericContextDescriptorHeader,
+</span><span>         </span><span style="color:#b48ead;">typename</span><span>... FollowingTrailingObjects&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingGenericContextObjects</span><span>;
+</span><span>
+</span><span style="color:#b48ead;">template</span><span>&lt;</span><span style="color:#b48ead;">class</span><span> Runtime,
+</span><span>         </span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span>&gt; </span><span style="color:#b48ead;">class</span><span> TargetSelf,
+</span><span>         </span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span>&gt; </span><span style="color:#b48ead;">class</span><span> TargetGenericContextHeaderType,
+</span><span>         </span><span style="color:#b48ead;">typename</span><span>... FollowingTrailingObjects&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingGenericContextObjects</span><span style="color:#eff1f5;">&lt;TargetSelf&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">                                    TargetGenericContextHeaderType,
+</span><span style="color:#eff1f5;">                                    FollowingTrailingObjects</span><span>...</span><span style="color:#eff1f5;">&gt; :
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">protected </span><span style="color:#a3be8c;">swift::ABI::TrailingObjects</span><span style="color:#eff1f5;">&lt;TargetSelf&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">      TargetGenericContextHeaderType&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">      GenericParamDescriptor,
+</span><span style="color:#eff1f5;">      TargetGenericRequirementDescriptor&lt;Runtime&gt;,
+</span><span style="color:#eff1f5;">      FollowingTrailingObjects</span><span>...</span><span style="color:#eff1f5;">&gt;
+</span><span style="color:#eff1f5;">{ </span><span style="color:#65737e;">/* ... */ </span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<p>通过定义可知，<code>TrailingGenericContextObjects</code> 在使用时有两个定参（<code>Self</code>、<code>TargetGenericContextHeaderType</code>）和一个不定参模板参数（<code>FollowingTrailingObjects...</code>），下面有一个偏特化定义，主要作用是萃取 <code>Runtime</code> 参数以便后用。这个偏特化的定义直接继承了 <code>TrailingObjects</code>，即我们接下来要重点分析的类型，实现如下：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> BaseTy, </span><span style="color:#b48ead;">typename</span><span>... TrailingTys&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingObjects </span><span style="color:#eff1f5;">: </span><span style="color:#b48ead;">private </span><span style="color:#a3be8c;">trailing_objects_internal::TrailingObjectsImpl</span><span style="color:#eff1f5;">&lt;
+</span><span style="color:#eff1f5;">                            trailing_objects_internal::AlignmentCalcHelper&lt;
+</span><span style="color:#eff1f5;">                                TrailingTys</span><span>...</span><span style="color:#eff1f5;">&gt;::Alignment,
+</span><span style="color:#eff1f5;">                            BaseTy, TrailingObjects&lt;BaseTy, TrailingTys</span><span>...</span><span style="color:#eff1f5;">&gt;,
+</span><span style="color:#eff1f5;">                            BaseTy, TrailingTys</span><span>...</span><span style="color:#eff1f5;">&gt; {
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#b48ead;">private</span><span style="color:#eff1f5;">:
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// These two methods are the base of the recursion for this method.
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">static const</span><span style="color:#eff1f5;"> BaseTy </span><span>*
+</span><span style="color:#eff1f5;">  </span><span style="color:#8fa1b3;">getTrailingObjectsImpl</span><span style="color:#eff1f5;">(</span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;"> BaseTy </span><span>*</span><span style="color:#bf616a;">Obj</span><span style="color:#eff1f5;">,
+</span><span style="color:#eff1f5;">                         TrailingObjectsBase::OverloadToken&lt;BaseTy&gt;) {
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return</span><span style="color:#eff1f5;"> Obj;
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">static</span><span style="color:#eff1f5;"> BaseTy </span><span>*
+</span><span style="color:#eff1f5;">  </span><span style="color:#8fa1b3;">getTrailingObjectsImpl</span><span style="color:#eff1f5;">(BaseTy </span><span>*</span><span style="color:#bf616a;">Obj</span><span style="color:#eff1f5;">,
+</span><span style="color:#eff1f5;">                         TrailingObjectsBase::OverloadToken&lt;BaseTy&gt;) {
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return</span><span style="color:#eff1f5;"> Obj;
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#b48ead;">public</span><span style="color:#eff1f5;">:
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">/// Returns a pointer to the trailing object array of the given type
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">/// (which must be one of those specified in the class template). The
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">/// array may have zero or more elements in it.
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">template </span><span style="color:#eff1f5;">&lt;</span><span style="color:#b48ead;">typename</span><span style="color:#eff1f5;"> T&gt; </span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;"> T </span><span>*</span><span style="color:#8fa1b3;">getTrailingObjects</span><span style="color:#eff1f5;">() </span><span style="color:#b48ead;">const </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">    </span><span style="color:#65737e;">// Forwards to an impl function with overloads, since member
+</span><span style="color:#eff1f5;">    </span><span style="color:#65737e;">// function templates can&#39;t be specialized.
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">-&gt;</span><span style="color:#bf616a;">getTrailingObjectsImpl</span><span style="color:#eff1f5;">(
+</span><span style="color:#eff1f5;">        </span><span>static_cast</span><span style="color:#eff1f5;">&lt;</span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;"> BaseTy </span><span>*</span><span style="color:#eff1f5;">&gt;(</span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">),
+</span><span style="color:#eff1f5;">        TrailingObjectsBase::</span><span style="color:#bf616a;">OverloadToken</span><span style="color:#eff1f5;">&lt;T&gt;());
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<p>通过模板参数的声明我们可以大致猜想到，这个类型除了第一个模板参数（<code>BaseTy</code>），其他不定参模板参数的角色都是相同的，对应到 <code>TrailingGenericContextObjects</code> 类型上，除了第一个 <code>TargetSelf&lt;Runtime&gt;</code> 参数，其他参数 <code>TrailingObjects</code> 并不实际感知。那么就可以得出结论，<code>TrailingGenericContextObjects</code> 实际上就是为它的参数追加上一部分额外参数（与 Swift 泛型相关），传递给 <code>TrailingObjects</code> 使用，充当了一层装饰器。这里我们可以先忽略它的作用。</p>
+<h2 id="trailingobjects">TrailingObjects</h2>
+<p>接下来我们继续分析 <code>TrailingObjects</code>。</p>
+<p>通过前面的代码，我们可以看到这个类型定义了一些方法，但没有任何存储字段，并且可以看到它对接受的模板参数进行了一些类型计算，又传给了父类作为模板参数。其父类是 <code>TrailingObjects</code> 的核心实现，我们也一块来看一下定义：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">int</span><span> Align, </span><span style="color:#b48ead;">typename</span><span> BaseTy, </span><span style="color:#b48ead;">typename</span><span> TopTrailingObj, </span><span style="color:#b48ead;">typename</span><span> PrevTy,
+</span><span>          </span><span style="color:#b48ead;">typename</span><span>... MoreTys&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingObjectsImpl </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// The main template definition is never used -- the two
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// specializations cover all possibilities.
+</span><span style="color:#eff1f5;">}</span><span>;
+</span><span>
+</span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">int</span><span> Align, </span><span style="color:#b48ead;">typename</span><span> BaseTy, </span><span style="color:#b48ead;">typename</span><span> TopTrailingObj, </span><span style="color:#b48ead;">typename</span><span> PrevTy,
+</span><span>          </span><span style="color:#b48ead;">typename</span><span> NextTy, </span><span style="color:#b48ead;">typename</span><span>... MoreTys&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingObjectsImpl</span><span style="color:#eff1f5;">&lt;Align, BaseTy, TopTrailingObj, PrevTy, NextTy,
+</span><span style="color:#eff1f5;">                          MoreTys</span><span>...</span><span style="color:#eff1f5;">&gt;
+</span><span style="color:#eff1f5;">    : </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">TrailingObjectsImpl</span><span style="color:#eff1f5;">&lt;Align, BaseTy, TopTrailingObj, NextTy,
+</span><span style="color:#eff1f5;">                                 MoreTys</span><span>...</span><span style="color:#eff1f5;">&gt; {
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">}</span><span>;
+</span><span>
+</span><span style="color:#65737e;">/*
+</span><span style="color:#65737e;">  trailing_objects_internal::TrailingObjectsImpl&lt;
+</span><span style="color:#65737e;">    trailing_objects_internal::AlignmentCalcHelper&lt;TrailingTys...&gt;::Alignment,
+</span><span style="color:#65737e;">    BaseTy,
+</span><span style="color:#65737e;">    TrailingObjects&lt;BaseTy, TrailingTys...&gt;,
+</span><span style="color:#65737e;">    BaseTy,
+</span><span style="color:#65737e;">    TrailingTys...
+</span><span style="color:#65737e;">  &gt;
+</span><span style="color:#65737e;">*/
+</span></code></pre>
+<p>这个类型继承了它自己，因此这是一个递归模板，<strong>是处理不定参模板的一种手段</strong>。在这种模式下，每一层类型都可以获取到参数列表中的一项，然后把剩下的参数传给父类，那么它的父类就可以处理下一项，然后继续把剩下的参数传给父类...</p>
+<p>很像 Lisp 和 Haskell 等 FP 语言处理列表的方式，有兴趣的同学可以看看这篇文章：<a href="http://learnyouahaskell.com/recursion#maximum-awesome">Learn You a Haskell for Great Good! - Recursion</a></p>
+<p>但是自己继承自己如果没有终止条件就会死循环，因此一定存在一个(偏)特化用于终止递归：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#65737e;">// The base case of the TrailingObjectsImpl inheritance recursion,
+</span><span style="color:#65737e;">// when there&#39;s no more trailing types.
+</span><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">int</span><span> Align, </span><span style="color:#b48ead;">typename</span><span> BaseTy, </span><span style="color:#b48ead;">typename</span><span> TopTrailingObj, </span><span style="color:#b48ead;">typename</span><span> PrevTy&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingObjectsImpl</span><span style="color:#eff1f5;">&lt;Align, BaseTy, TopTrailingObj, PrevTy&gt;
+</span><span style="color:#eff1f5;">    : </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">TrailingObjectsAligner</span><span style="color:#eff1f5;">&lt;Align&gt; {
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">}</span><span>;
+</span><span>
+</span><span style="color:#65737e;">/*
+</span><span style="color:#65737e;">  matching TrailingObjectsImpl&lt;Align, BaseTy, TopTrailingObj, NextTy, MoreTys...&gt;
+</span><span style="color:#65737e;">    with MoreTys = []
+</span><span style="color:#65737e;">*/
+</span></code></pre>
+<p>整个模板递归展开的过程大家可以使用 <strong>cppinsights</strong> 这个工具来查看，我这里已经做好了一个可编译的版本可以直接打开：<a href="https://cppinsights.io/s/8de0f488">https://cppinsights.io/s/8de0f488</a></p>
+<p>接下来我们来看递归的每层类型为最终的类型添加了什么内容：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TrailingObjectsImpl</span><span style="color:#eff1f5;">&lt;Align, BaseTy, TopTrailingObj, </span><span style="color:#65737e;">/* 顶层完整类型 */
+</span><span style="color:#eff1f5;">    PrevTy, </span><span style="color:#65737e;">/* 上一层处理的模板参数 */
+</span><span style="color:#eff1f5;">    NextTy, </span><span style="color:#65737e;">/* 当前层处理的模板参数 */
+</span><span style="color:#eff1f5;">    MoreTys</span><span>... </span><span style="color:#65737e;">/* 下一层处理的模板参数列表 */</span><span style="color:#eff1f5;">&gt; </span><span style="color:#65737e;">/* : ... */ </span><span style="color:#eff1f5;">{
+</span><span style="color:#b48ead;">protected</span><span style="color:#eff1f5;">:
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">static const</span><span style="color:#eff1f5;"> NextTy </span><span>*
+</span><span style="color:#eff1f5;">  </span><span style="color:#8fa1b3;">getTrailingObjectsImpl</span><span style="color:#eff1f5;">(</span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;"> BaseTy </span><span>*</span><span style="color:#bf616a;">Obj</span><span style="color:#eff1f5;">,
+</span><span style="color:#eff1f5;">                         TrailingObjectsBase::OverloadToken&lt;NextTy&gt;) {
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">auto </span><span>*</span><span style="color:#eff1f5;">Ptr </span><span>= </span><span style="color:#eff1f5;">TopTrailingObj::</span><span style="color:#bf616a;">getTrailingObjectsImpl</span><span style="color:#eff1f5;">(
+</span><span style="color:#eff1f5;">                    Obj, TrailingObjectsBase::</span><span style="color:#bf616a;">OverloadToken</span><span style="color:#eff1f5;">&lt;PrevTy&gt;()) </span><span>+
+</span><span style="color:#eff1f5;">                TopTrailingObj::</span><span style="color:#bf616a;">callNumTrailingObjects</span><span style="color:#eff1f5;">(
+</span><span style="color:#eff1f5;">                    Obj, TrailingObjectsBase::</span><span style="color:#bf616a;">OverloadToken</span><span style="color:#eff1f5;">&lt;PrevTy&gt;());
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">if </span><span style="color:#eff1f5;">(</span><span style="color:#bf616a;">requiresRealignment</span><span style="color:#eff1f5;">())
+</span><span style="color:#eff1f5;">      </span><span style="color:#b48ead;">return </span><span>reinterpret_cast</span><span style="color:#eff1f5;">&lt;</span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;"> NextTy </span><span>*</span><span style="color:#eff1f5;">&gt;(
+</span><span style="color:#eff1f5;">          llvm::</span><span style="color:#bf616a;">alignAddr</span><span style="color:#eff1f5;">(Ptr, llvm::</span><span style="color:#bf616a;">Align</span><span style="color:#eff1f5;">(</span><span>alignof</span><span style="color:#eff1f5;">(NextTy))));
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">else
+</span><span style="color:#eff1f5;">      </span><span style="color:#b48ead;">return </span><span>reinterpret_cast</span><span style="color:#eff1f5;">&lt;</span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;"> NextTy </span><span>*</span><span style="color:#eff1f5;">&gt;(Ptr);
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<p>可以看到每一层都会有一个 <code>getTrailingObjectsImpl</code> 方法的重载，这个就是 <code>TrailingObjectsImpl</code> 最核心的方法，可以看到它能够返回当前层所处理的类型。同时他接受一个比较特殊的参数 <code>OverloadToken</code>，之所以存在这个参数是因为 C++ 不支持仅返回值不同的函数重载，也不支持模板函数的(偏)特化，因此这个参数是用来帮助编译器确定我们需要的重载版本的，函数体内并不需要关心其内容。其他语言中也有类似的技术，比如 Rust 的 <a href="https://doc.rust-lang.org/std/marker/struct.PhantomData.html">PhantomData</a>。</p>
+<p>继续来看函数的实现，它调用了 <code>TopTrailingObj</code> 的 <code>getTrailingObjectsImpl</code> 方法并传入了 <code>PrevTy</code> 构造的 <code>OverloadToken</code>。这里 <code>TopTrailingObj</code> 表示一个完整类型，可以像外界一样获取到整个类型层次中的所有成员。很明显这里其实也是一个递归调用，<code>PrevTy</code> 向前追溯是 <code>BaseTy</code>，所以我们看看返回 <code>BaseTy</code> 的重载版本，它位于 <code>TrailingObjects</code> 这个类型：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">static const</span><span> BaseTy *
+</span><span style="color:#8fa1b3;">getTrailingObjectsImpl</span><span>(</span><span style="color:#b48ead;">const</span><span> BaseTy *</span><span style="color:#bf616a;">Obj</span><span>,
+</span><span>                       TrailingObjectsBase::OverloadToken&lt;BaseTy&gt;) {
+</span><span>  </span><span style="color:#b48ead;">return</span><span> Obj;
+</span><span>}
+</span></code></pre>
+<p><code>callNumTrailingObjects</code> 则是直接调用到 <code>TopTrailingObj</code> 中的实现了，因为每层类型中并没有增加重载，它的实现如下：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> T&gt;
+</span><span>  </span><span style="color:#b48ead;">static </span><span>size_t </span><span style="color:#8fa1b3;">callNumTrailingObjects</span><span>(</span><span style="color:#b48ead;">const</span><span> BaseTy *</span><span style="color:#bf616a;">Obj</span><span>,
+</span><span>                                       TrailingObjectsBase::OverloadToken&lt;T&gt;) {
+</span><span>    </span><span style="color:#b48ead;">return</span><span> Obj-&gt;</span><span style="color:#bf616a;">numTrailingObjects</span><span>(TrailingObjectsBase::</span><span style="color:#bf616a;">OverloadToken</span><span>&lt;T&gt;());
+</span><span>  }
+</span></code></pre>
+<p>这里是用到了 <code>BaseTy</code> 这个参数，在 <code>TargetStructDescriptor</code> 的使用场景中 <code>BaseTy</code> 为 <code>TargetStructDescriptor&lt;Runtime&gt;</code>，而 <code>TargetStructDescriptor</code> 继承自 <code>TrailingObjects</code>，这种手法叫 <a href="https://en.wikipedia.org/wiki/Curiously_recurring_template_pattern">CRTP</a>，即父类通过模板参数感知子类，从而实现编译期多态。在这个例子中，<code>callNumTrailingObjects</code> 调用到 <code>TargetStructDescriptor</code> 中的 <code>numTrailingObjects</code> 实现，实现不同类型的自定义行为：</p>
+<pre data-lang="c++" style="background-color:#2b303b;color:#c0c5ce;" class="language-c++ "><code class="language-c++" data-lang="c++"><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">TargetStructDescriptor </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">  size_t </span><span style="color:#8fa1b3;">numTrailingObjects</span><span style="color:#eff1f5;">(OverloadToken&lt;ForeignMetadataInitialization&gt;) </span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">-&gt;</span><span style="color:#bf616a;">hasForeignMetadataInitialization</span><span style="color:#eff1f5;">() </span><span>? </span><span style="color:#d08770;">1 </span><span>: </span><span style="color:#d08770;">0</span><span style="color:#eff1f5;">;
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  size_t </span><span style="color:#8fa1b3;">numTrailingObjects</span><span style="color:#eff1f5;">(OverloadToken&lt;SingletonMetadataInitialization&gt;) </span><span style="color:#b48ead;">const</span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">-&gt;</span><span style="color:#bf616a;">hasSingletonMetadataInitialization</span><span style="color:#eff1f5;">() </span><span>? </span><span style="color:#d08770;">1 </span><span>: </span><span style="color:#d08770;">0</span><span style="color:#eff1f5;">;
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  size_t </span><span style="color:#8fa1b3;">numTrailingObjects</span><span style="color:#eff1f5;">(OverloadToken&lt;MetadataListCount&gt;) </span><span style="color:#b48ead;">const </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">-&gt;</span><span style="color:#bf616a;">hasCanonicicalMetadataPrespecializations</span><span style="color:#eff1f5;">() </span><span>?
+</span><span style="color:#eff1f5;">      </span><span style="color:#d08770;">1
+</span><span style="color:#eff1f5;">      </span><span>: </span><span style="color:#d08770;">0</span><span style="color:#eff1f5;">;
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  size_t </span><span style="color:#8fa1b3;">numTrailingObjects</span><span style="color:#eff1f5;">(OverloadToken&lt;MetadataListEntry&gt;) </span><span style="color:#b48ead;">const </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">    </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">-&gt;</span><span style="color:#bf616a;">hasCanonicicalMetadataPrespecializations</span><span style="color:#eff1f5;">() </span><span>?
+</span><span style="color:#eff1f5;">      </span><span style="color:#bf616a;">this</span><span style="color:#eff1f5;">-&gt;</span><span style="color:#b48ead;">template </span><span style="color:#bf616a;">getTrailingObjects</span><span style="color:#eff1f5;">&lt;MetadataListCount&gt;()-&gt;</span><span style="color:#bf616a;">count
+</span><span style="color:#eff1f5;">      </span><span>: </span><span style="color:#d08770;">0</span><span style="color:#eff1f5;">;
+</span><span style="color:#eff1f5;">  }
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<h3 id="yong-fa-fen-xi-xiao-jie">用法分析 &amp; 小结</h3>
+<p>到这里我们就可以分析一下 <code>TrailingObjects</code> 的作用了。首先整个 <code>TrailingObjects</code> 继承链中没有任何存储字段，因此当一个类型继承它是不会更改内存布局。然后来看一下 <code>getTrailingObjects</code> 方法的逻辑，假设对于 <code>TrailingObjects&lt;Base, A, B&gt;</code> 调用 <code>getTrailingObjects&lt;B&gt;()</code>，其调用过程为：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>getTrailingObjects&lt;B&gt;()
+</span><span>= getTrailingObjectsImpl&lt;B&gt;()
+</span><span>= getTrailingObjectsImpl(A) + callNumTrailingObjects(A)
+</span><span>= (A*)(getTrailingObjectsImpl(Base) + callNumTrailingObjects(Base)) + callNumTrailingObjects(A)
+</span></code></pre>
+<p>可以得出 <code>TrailingObjects</code> 作用的结构内存布局为：</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>+------+------------+------------+
+</span><span>| Base | A * num(A) | B * num(B) |
+</span><span>+------+------------+------------+
+</span></code></pre>
+<p>这与 Swift ABI 约定的 Metadata 在二进制中的布局一致，通过 <code>TrailingObjects</code> 我们可以自由地声明类型的内存映射，在顺序和数量上的调整更加灵活。相比于简单的指针偏移计算，它能够提供更强的类型安全性，并且能够复用大部分计算逻辑，减少代码错误。</p>
+<p>当然这种结构也有一些不大不小的缺点，比如会让代码看起来更晦涩，不太容易看出类型的真实结构；另一方面，受制于 C++ 编译器的优化能力，模板 + 非尾递归的代码不能被优化为简单的表达式计算（尽管它在运行时做的确实就是一个简单的表达式计算），在运行效率上可能有一定开销，至少方法调用是真实存在的：</p>
+<p><img src="/images/swift-runtime-trailing-objects/5.png" alt="bt" /></p>
+<h2 id="zong-jie">总结</h2>
+<p>本文通过对 <code>TrailingObjects</code> 的分析，用具体例子介绍了自己在 Swift Runtime 的调试和源码阅读上的思路。相比 Objective-C Runtime，Swift Runtime 在复杂度和抽象程度上会更上一层，不过好在调试相对更容易。</p>
+<p>希望本文对大家可以起到抛砖引玉的作用。</p>
+<h2 id="xiang-guan-lian-jie">相关链接</h2>
+<ol>
+<li><a href="https://swift.org/blog/abi-stability-and-more/">ABI Stability and More</a></li>
+<li><a href="https://github.com/apple/swift/blob/e65ae80172ade4120ef51c100e1a69026866936e/include/swift/ABI/TrailingObjects.h">TrailingObjects.h</a></li>
+<li><a href="https://github.com/apple/swift/blob/e65ae80172ade4120ef51c100e1a69026866936e/include/swift/ABI/Metadata.h">Metadata.h</a></li>
+<li><a href="https://en.cppreference.com/w/cpp/language/partial_specialization">Partial template specialization - cppreference.com</a></li>
+<li><a href="https://zhuanlan.zhihu.com/p/129329663">C++ Compiler as a Brainfuck Interpreter</a></li>
+<li><a href="https://zhuanlan.zhihu.com/p/58179258">从源码解析 Swift 弱引用</a></li>
+</ol>
+
+        </div>
+
+                </div>
+            <div class="pagination">
+                <div class="pagination__buttons">
+                    <span class="button previous">
+                        <a href="https://unixzii.github.io/">
+                            <span class="button__icon">←</span>&nbsp;
+                            <span class="button__text">Newer posts</span>
+                        </a>
+                    </span>
+                
+                    <span class="button next">
+                        <a href="https://unixzii.github.io/page/3/">
+                            <span class="button__text">Older posts</span>&nbsp;
+                            <span class="button__icon">→</span>
+                        </a>
+                    </span>
+                </div>
+            </div>
+        </div>
+        
+
+        
+        <footer class="footer">
+                <div class="copyright">
+                        <span>© 
+    2022
+ Cyandev</span>
+                        <span class="copyright-sep">::  </span>
+                        <span>Powered by <a href="https://www.getzola.org/">Zola</a></span>
+                    
+                </div>
+            </footer>
+        
+    </div>
+
+</div>
+</body>
+
+</html>

@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>Cyandev&#x27;s Blog</title>
+    
+    <meta http-equiv="content-type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+    <meta name="robots" content="noodp"/>
+
+    <link rel="stylesheet" href="https://unixzii.github.io/style.css">
+    <link rel="stylesheet" href="https://unixzii.github.io/color/orange.css">
+
+        <link rel="stylesheet" href="https://unixzii.github.io/color/background_blue.css">
+    
+    <link rel="stylesheet" href="https://unixzii.github.io/font-hack-subset.css">
+
+    </head>
+
+<body class="">
+<div class="container">
+    
+    
+
+    <aside class="aside">
+        <div class="adaptive-container">
+            <div class="aside__logo">
+                <!-- Customized logo area (will not be affected by config) -->
+                <strong>Cyandev's</strong>
+                <br>
+                <span style="font-weight: 100;">Blog</span>
+            </div>
+            <div class="aside__menu">
+                
+                    
+                <nav class="menu">
+            <ul class="menu__inner">
+                <li class="active"><a href="https://unixzii.github.io/">posts</a></li>
+            
+                <li><a href="https://unixzii.github.io//archive">archive</a></li>
+            
+                <li><a href="https://unixzii.github.io//tags">tags</a></li>
+            
+                <li><a href="https://unixzii.github.io//about">about</a></li>
+            </ul>
+        </nav>
+    
+    
+                
+            </div>
+        </div>
+    </aside>
+
+    <div class="content">
+        
+        <div class="posts">
+                <div class="post on-list">
+                    
+    <h1 class="post-title"><a href="https://unixzii.github.io/swift-weak-reference/">从源码解析 Swift 弱引用</a></h1>
+    <div class="post-meta-inline">
+        
+    <span class="post-date">
+            2019-03-03
+        </span>
+
+    </div>
+
+    
+        <span class="post-tags-inline">
+                :: tags:&nbsp;
+                <a class="post-tag" href="https://unixzii.github.io/tags/swift/">#swift</a>&nbsp;
+                <a class="post-tag" href="https://unixzii.github.io/tags/internals/">#internals</a></span>
+    
+
+                    
+        <div class="post-content">
+            <blockquote>
+<p>序言：各个社区有关 Objective-C weak 机制的实现分析文章有很多，然而 Swift 发布这么长时间以来，有关 ABI 的分析文章一直非常少，似乎也是很多 iOS 开发者未涉及的领域… 本文就从源码层面分析一下 Swift 是如何实现 weak 机制的。</p>
+</blockquote>
+<h2 id="zhun-bei-gong-zuo">准备工作</h2>
+<p>由于 Swift 源码量较大，强烈建议大家把 repo clone 下来，结合源码一起来看这篇文章。</p>
+<pre style="background-color:#2b303b;color:#c0c5ce;"><code><span>$ git clone https://github.com/apple/swift.git
+</span></code></pre>
+<p>Swift 整个工程采用了 CMake 作为构建工具，如果你想用 Xcode 来打开的话需要先安装 LLVM，然后用 <code>cmake -G</code> 生成 Xcode 项目。</p>
+<p>我们这里只是进行源码分析，我就直接用 <strong>Visual Studio Code</strong> 配合 <strong>C/C++</strong> 插件了，同样支持符号跳转、查找引用。另外提醒一下大家，Swift stdlib 里 C++ 代码的类型层次比较复杂，不使用 IDE 辅助阅读起来会相当费劲。</p>
+<h2 id="zheng-wen">正文</h2>
+<p>下面我们就正式进入源码分析阶段，首先我们来看一下 Swift 中的对象（<code>class</code> 实例）它的内存布局是怎样的。</p>
+<h3 id="heapobject"><code>HeapObject</code></h3>
+<p>我们知道 Objective-C 在 runtime 中通过 <code>objc_object</code> 来表示一个对象，这些类型定义了对象在内存中头部的结构。同样的，在 Swift 中也有类似的结构，那就是 <code>HeapObject</code>，我们来看一下它的定义：</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">struct </span><span>HeapObject {
+</span><span>  </span><span style="color:#65737e;">/// This is always a valid pointer to a metadata object.
+</span><span>  HeapMetadata </span><span style="color:#b48ead;">const </span><span>*metadata;
+</span><span>
+</span><span>  SWIFT_HEAPOBJECT_NON_OBJC_MEMBERS;
+</span><span>
+</span><span>  </span><span style="color:#8fa1b3;">HeapObject</span><span>() = </span><span style="color:#b48ead;">default</span><span>;
+</span><span>
+</span><span>  </span><span style="color:#65737e;">// Initialize a HeapObject header as appropriate for a newly-allocated object.
+</span><span>  </span><span style="color:#b48ead;">constexpr </span><span style="color:#8fa1b3;">HeapObject</span><span>(HeapMetadata </span><span style="color:#b48ead;">const </span><span>*</span><span style="color:#bf616a;">newMetadata</span><span>)
+</span><span>    : </span><span style="color:#bf616a;">metadata</span><span>(newMetadata)
+</span><span>    , </span><span style="color:#bf616a;">refCounts</span><span>(InlineRefCounts::Initialized)
+</span><span>  { }
+</span><span>
+</span><span>  </span><span style="color:#65737e;">// Initialize a HeapObject header for an immortal object
+</span><span>  </span><span style="color:#b48ead;">constexpr </span><span style="color:#8fa1b3;">HeapObject</span><span>(HeapMetadata </span><span style="color:#b48ead;">const </span><span>*</span><span style="color:#bf616a;">newMetadata</span><span>,
+</span><span>                       InlineRefCounts::Immortal_t </span><span style="color:#bf616a;">immortal</span><span>)
+</span><span>  : </span><span style="color:#bf616a;">metadata</span><span>(newMetadata)
+</span><span>  , </span><span style="color:#bf616a;">refCounts</span><span>(InlineRefCounts::Immortal)
+</span><span>  { }
+</span><span>
+</span><span>};
+</span></code></pre>
+<p>可以看到，<code>HeapObject</code> 的第一个字段是一个 <code>HeapMetadata</code> 对象，这个对象有着与 <code>isa_t</code> 类似的作用，就是用来描述对象类型的（等价于 <code>type(of:)</code> 取得的结果），只不过 Swift 在很多情况下并不会用到它，比如静态方法派发等等。</p>
+<p>接下来是 <code>SWIFT_HEAPOBJECT_NON_OBJC_MEMBERS</code>，这是一个宏定义，展开后即：</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span>RefCounts&lt;InlineRefCountBits&gt; refCounts;
+</span></code></pre>
+<p>这是一个相当重要东西，引用计数、弱引用、unowned 引用都与它有关，同时它也是 Swift 对象（文中后续的 Swift 对象均指引用类型，即 <code>class</code> 的实例）中较为复杂的一个结构。</p>
+<p>其实说复杂也并不是很复杂，我们知道 Objective-C runtime 里就有很多 <strong>union</strong> 结构的应用，例如 <code>isa_t</code> 有 <strong>pointer</strong> 类型也有 <strong>nonpointer</strong> 类型，它们都占用了相同的内存空间，这样做的好处就是能更高效地使用内存，尤其是这些大量使用到的东西，可以大大减少运行期的开销。类似的技术在 JVM 里也有，就如对象头的 mark word。当然，Swift ABI 中也大量采用这种技术。</p>
+<h3 id="refcounts-lei-xing-he-side-table"><code>RefCounts</code> 类型和 Side Table</h3>
+<p>上面说到 <code>RefCounts</code> 类型，这里我们就来看看它到底是个什么东西。</p>
+<p>先看一下定义：</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> RefCountBits&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">RefCounts </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">  std::atomic&lt;RefCountBits&gt; refCounts;
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<p>这就是 <code>RefCounts</code> 的内存布局，我这里省略了所有的方法和类型定义。你可以把 <code>RefCounts</code> 想象成一个线程安全的 wrapper，模板参数 <code>RefCountBits</code> 指定了真实的内部类型，在 Swift ABI 里总共有两种：</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">typedef</span><span> RefCounts&lt;InlineRefCountBits&gt; InlineRefCounts;
+</span><span style="color:#b48ead;">typedef</span><span> RefCounts&lt;SideTableRefCountBits&gt; SideTableRefCounts;
+</span></code></pre>
+<p>前者是用在 <code>HeapObject</code> 中的，而后者是用在 <code>HeapObjectSideTableEntry</code>（Side Table）中的，这两种类型后文我会一一讲到。</p>
+<p>一般来讲，Swift 对象并不会用到 Side Table，一旦对象被 weak 或 unowned 引用，该对象就会分配一个 Side Table。</p>
+<h4 id="inlinerefcountbits">InlineRefCountBits</h4>
+<p>定义：</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">typedef</span><span> RefCountBitsT&lt;RefCountIsInline&gt; InlineRefCountBits;
+</span><span>
+</span><span style="color:#b48ead;">template </span><span>&lt;RefCountInlinedness refcountIsInline&gt;
+</span><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">RefCountBitsT </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">friend class</span><span style="color:#eff1f5;"> RefCountBitsT&lt;RefCountIsInline&gt;;
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">friend class</span><span style="color:#eff1f5;"> RefCountBitsT&lt;RefCountNotInline&gt;;
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">static const</span><span style="color:#eff1f5;"> RefCountInlinedness Inlinedness </span><span>=</span><span style="color:#eff1f5;"> refcountIsInline;
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">typedef typename</span><span style="color:#eff1f5;"> RefCountBitsInt&lt;refcountIsInline, </span><span>sizeof</span><span style="color:#eff1f5;">(</span><span style="color:#b48ead;">void</span><span>*</span><span style="color:#eff1f5;">)&gt;::Type
+</span><span style="color:#eff1f5;">    BitsType;
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">typedef typename</span><span style="color:#eff1f5;"> RefCountBitsInt&lt;refcountIsInline, </span><span>sizeof</span><span style="color:#eff1f5;">(</span><span style="color:#b48ead;">void</span><span>*</span><span style="color:#eff1f5;">)&gt;::SignedType
+</span><span style="color:#eff1f5;">    SignedBitsType;
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">typedef</span><span style="color:#eff1f5;"> RefCountBitOffsets&lt;</span><span>sizeof</span><span style="color:#eff1f5;">(BitsType)&gt;
+</span><span style="color:#eff1f5;">    Offsets;
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  BitsType bits;
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<p>通过模板替换之后，<code>InlineRefCountBits</code> 实际上就是一个 <code>uint64_t</code>，相关的一堆类型就是为了通过模板元编程让代码可读性更高（或者更低，哈哈哈）。</p>
+<p>下面我们来模拟一下对象引用计数 +1：</p>
+<ol>
+<li>调用 SIL 接口 <code>swift::swift_retain</code>：</li>
+</ol>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span>HeapObject *swift::</span><span style="color:#8fa1b3;">swift_retain</span><span>(HeapObject *</span><span style="color:#bf616a;">object</span><span>) {
+</span><span>  </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">_swift_retain</span><span>(object);
+</span><span>}
+</span><span>
+</span><span style="color:#b48ead;">static</span><span> HeapObject *</span><span style="color:#8fa1b3;">_swift_retain_</span><span>(HeapObject *</span><span style="color:#bf616a;">object</span><span>) {
+</span><span>  </span><span style="color:#bf616a;">SWIFT_RT_TRACK_INVOCATION</span><span>(object, swift_retain);
+</span><span>  </span><span style="color:#b48ead;">if </span><span>(</span><span style="color:#bf616a;">isValidPointerForNativeRetain</span><span>(object))
+</span><span>    object-&gt;</span><span style="color:#bf616a;">refCounts</span><span>.</span><span style="color:#bf616a;">increment</span><span>(</span><span style="color:#d08770;">1</span><span>);
+</span><span>  </span><span style="color:#b48ead;">return</span><span> object;
+</span><span>}
+</span><span>
+</span><span style="color:#b48ead;">auto</span><span> swift::_swift_retain = _swift_retain_;
+</span></code></pre>
+<ol start="2">
+<li>调用 <code>RefCounts</code> 的 <code>increment</code> 方法：</li>
+</ol>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">void </span><span style="color:#8fa1b3;">increment</span><span>(uint32_t </span><span style="color:#bf616a;">inc </span><span>= </span><span style="color:#d08770;">1</span><span>) {
+</span><span>  </span><span style="color:#65737e;">// 3. 原子地读出 InlineRefCountBits 对象（即一个 uint64_t）。
+</span><span>  </span><span style="color:#b48ead;">auto</span><span> oldbits = refCounts.</span><span style="color:#bf616a;">load</span><span>(SWIFT_MEMORY_ORDER_CONSUME);
+</span><span>  RefCountBits newbits;
+</span><span>  </span><span style="color:#b48ead;">do </span><span>{
+</span><span>    newbits = oldbits;
+</span><span>    </span><span style="color:#65737e;">// 4. 调用 InlineRefCountBits 的 incrementStrongExtraRefCount 方法
+</span><span>    </span><span style="color:#65737e;">//    对这个 uint64_t 进行一系列运算。
+</span><span>    </span><span style="color:#b48ead;">bool</span><span> fast = newbits.</span><span style="color:#bf616a;">incrementStrongExtraRefCount</span><span>(inc);
+</span><span>    </span><span style="color:#65737e;">// 无 weak、unowned 引用时一般不会进入。
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(</span><span style="color:#bf616a;">SWIFT_UNLIKELY</span><span>(!fast)) {
+</span><span>      </span><span style="color:#b48ead;">if </span><span>(oldbits.</span><span style="color:#bf616a;">isImmortal</span><span>())
+</span><span>        </span><span style="color:#b48ead;">return</span><span>;
+</span><span>      </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">incrementSlow</span><span>(oldbits, inc);
+</span><span>    }
+</span><span>    </span><span style="color:#65737e;">// 5. 通过 CAS 将运算后的 uint64_t 设置回去。
+</span><span>  } </span><span style="color:#b48ead;">while </span><span>(!refCounts.</span><span style="color:#bf616a;">compare_exchange_weak</span><span>(oldbits, newbits,
+</span><span>                                            std::memory_order_relaxed));
+</span><span>}
+</span></code></pre>
+<p>到这里就完成了一次 retain 操作。</p>
+<h4 id="sidetablerefcountbits">SideTableRefCountBits</h4>
+<p>上面是不存在 weak、unowned 引用的情况，现在我们来看看增加一个 weak 引用会怎样。</p>
+<ol>
+<li>调用 SIL 接口 <code>swift::swift_weakAssign</code>（暂时省略这块的逻辑，它属于引用者的逻辑，我们现在先分析被引用者）</li>
+<li>调用 <code>RefCounts&lt;InlineRefCountBits&gt;::formWeakReference</code> 增加一个弱引用：</li>
+</ol>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">template </span><span>&lt;&gt;
+</span><span>HeapObjectSideTableEntry* RefCounts&lt;InlineRefCountBits&gt;::</span><span style="color:#8fa1b3;">formWeakReference</span><span>()
+</span><span>{
+</span><span>  </span><span style="color:#65737e;">// 分配一个 Side Table。
+</span><span>  </span><span style="color:#b48ead;">auto</span><span> side = </span><span style="color:#bf616a;">allocateSideTable</span><span>(</span><span style="color:#d08770;">true</span><span>);
+</span><span>  </span><span style="color:#b48ead;">if </span><span>(side)
+</span><span>    </span><span style="color:#65737e;">// 增加一个弱引用。
+</span><span>    </span><span style="color:#b48ead;">return</span><span> side-&gt;</span><span style="color:#bf616a;">incrementWeak</span><span>();
+</span><span>  </span><span style="color:#b48ead;">else
+</span><span>    </span><span style="color:#b48ead;">return </span><span style="color:#d08770;">nullptr</span><span>;
+</span><span>}
+</span></code></pre>
+<p>重点来看一下 <code>allocateSideTable</code> 的实现：</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">template </span><span>&lt;&gt;
+</span><span>HeapObjectSideTableEntry* RefCounts&lt;InlineRefCountBits&gt;::</span><span style="color:#8fa1b3;">allocateSideTable</span><span>(</span><span style="color:#b48ead;">bool </span><span style="color:#bf616a;">failIfDeiniting</span><span>)
+</span><span>{
+</span><span>  </span><span style="color:#b48ead;">auto</span><span> oldbits = refCounts.</span><span style="color:#bf616a;">load</span><span>(SWIFT_MEMORY_ORDER_CONSUME);
+</span><span>
+</span><span>  </span><span style="color:#65737e;">// 已有 Side Table 或正在析构就直接返回。
+</span><span>  </span><span style="color:#b48ead;">if </span><span>(oldbits.</span><span style="color:#bf616a;">hasSideTable</span><span>()) {
+</span><span>    </span><span style="color:#b48ead;">return</span><span> oldbits.</span><span style="color:#bf616a;">getSideTable</span><span>();
+</span><span>  }
+</span><span>  </span><span style="color:#b48ead;">else if </span><span>(failIfDeiniting &amp;&amp; oldbits.</span><span style="color:#bf616a;">getIsDeiniting</span><span>()) {
+</span><span>    </span><span style="color:#b48ead;">return </span><span style="color:#d08770;">nullptr</span><span>;
+</span><span>  }
+</span><span>
+</span><span>  </span><span style="color:#65737e;">// 分配 Side Table 对象。
+</span><span>  HeapObjectSideTableEntry *side = </span><span style="color:#b48ead;">new </span><span style="color:#bf616a;">HeapObjectSideTableEntry</span><span>(</span><span style="color:#bf616a;">getHeapObject</span><span>());
+</span><span>
+</span><span>  </span><span style="color:#b48ead;">auto</span><span> newbits = </span><span style="color:#bf616a;">InlineRefCountBits</span><span>(side);
+</span><span>
+</span><span>  </span><span style="color:#b48ead;">do </span><span>{
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(oldbits.</span><span style="color:#bf616a;">hasSideTable</span><span>()) {
+</span><span>      </span><span style="color:#65737e;">// 此时可能其他线程创建了 Side Table，删除该线程分配的，然后返回。
+</span><span>      </span><span style="color:#b48ead;">auto</span><span> result = oldbits.</span><span style="color:#bf616a;">getSideTable</span><span>();
+</span><span>      </span><span style="color:#b48ead;">delete</span><span> side;
+</span><span>      </span><span style="color:#b48ead;">return</span><span> result;
+</span><span>    }
+</span><span>    </span><span style="color:#b48ead;">else if </span><span>(failIfDeiniting &amp;&amp; oldbits.</span><span style="color:#bf616a;">getIsDeiniting</span><span>()) {
+</span><span>      </span><span style="color:#b48ead;">return </span><span style="color:#d08770;">nullptr</span><span>;
+</span><span>    }
+</span><span>
+</span><span>    </span><span style="color:#65737e;">// 用当前的 InlineRefCountBits 初始化 Side Table。
+</span><span>    side-&gt;</span><span style="color:#bf616a;">initRefCounts</span><span>(oldbits);
+</span><span>    </span><span style="color:#65737e;">// 进行 CAS。
+</span><span>  } </span><span style="color:#b48ead;">while </span><span>(! refCounts.</span><span style="color:#bf616a;">compare_exchange_weak</span><span>(oldbits, newbits,
+</span><span>                                             std::memory_order_release,
+</span><span>                                             std::memory_order_relaxed));
+</span><span>  </span><span style="color:#b48ead;">return</span><span> side;
+</span><span>}
+</span></code></pre>
+<p>还记得 <code>HeapObject</code> 里的 <code>RefCounts</code> 实际上是 <code>InlineRefCountBits</code> 的一个 wrapper 吗？上面构造完 Side Table 以后，对象中的 <code>InlineRefCountBits</code> 就不是原来的引用计数了，而是一个指向 Side Table 的指针，然而由于它们实际都是 <code>uint64_t</code>，因此需要一个方法来区分。区分的方法我们可以来看 <code>InlineRefCountBits</code> 的构造函数：</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span>LLVM_ATTRIBUTE_ALWAYS_INLINE
+</span><span>  </span><span style="color:#bf616a;">RefCountBitsT</span><span>(HeapObjectSideTableEntry* side)
+</span><span>    : </span><span style="color:#bf616a;">bits</span><span>((reinterpret_cast&lt;BitsType&gt;(side) &gt;&gt; Offsets::SideTableUnusedLowBits)
+</span><span>           | (</span><span style="color:#bf616a;">BitsType</span><span>(</span><span style="color:#d08770;">1</span><span>) &lt;&lt; Offsets::UseSlowRCShift)
+</span><span>           | (</span><span style="color:#bf616a;">BitsType</span><span>(</span><span style="color:#d08770;">1</span><span>) &lt;&lt; Offsets::SideTableMarkShift))
+</span><span>  {
+</span><span>    </span><span style="color:#96b5b4;">assert</span><span>(refcountIsInline);
+</span><span>  }
+</span></code></pre>
+<p>其实还是最常见的方法，把指针地址无用的位替换成标识位。</p>
+<p>顺便，看一下 Side Table 的结构：</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">HeapObjectSideTableEntry </span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// FIXME: does object need to be atomic?
+</span><span style="color:#eff1f5;">  std::atomic&lt;HeapObject</span><span>*</span><span style="color:#eff1f5;">&gt; object;
+</span><span style="color:#eff1f5;">  SideTableRefCounts refCounts;
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  </span><span style="color:#b48ead;">public</span><span style="color:#eff1f5;">:
+</span><span style="color:#eff1f5;">  </span><span style="color:#8fa1b3;">HeapObjectSideTableEntry</span><span style="color:#eff1f5;">(HeapObject </span><span>*</span><span style="color:#bf616a;">newObject</span><span style="color:#eff1f5;">)
+</span><span style="color:#eff1f5;">    : </span><span style="color:#bf616a;">object</span><span style="color:#eff1f5;">(newObject), </span><span style="color:#bf616a;">refCounts</span><span style="color:#eff1f5;">()
+</span><span style="color:#eff1f5;">  { }
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<p>此时再增加引用计数会怎样呢？来看下之前的 <code>RefCounts::increment</code> 方法：</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">void </span><span style="color:#8fa1b3;">increment</span><span>(uint32_t </span><span style="color:#bf616a;">inc </span><span>= </span><span style="color:#d08770;">1</span><span>) {
+</span><span>  </span><span style="color:#b48ead;">auto</span><span> oldbits = refCounts.</span><span style="color:#bf616a;">load</span><span>(SWIFT_MEMORY_ORDER_CONSUME);
+</span><span>  RefCountBits newbits;
+</span><span>  </span><span style="color:#b48ead;">do </span><span>{
+</span><span>    newbits = oldbits;
+</span><span>    </span><span style="color:#b48ead;">bool</span><span> fast = newbits.</span><span style="color:#bf616a;">incrementStrongExtraRefCount</span><span>(inc);
+</span><span>    </span><span style="color:#65737e;">// ---&gt; 这次进入这个分支。
+</span><span>    </span><span style="color:#b48ead;">if </span><span>(</span><span style="color:#bf616a;">SWIFT_UNLIKELY</span><span>(!fast)) {
+</span><span>      </span><span style="color:#b48ead;">if </span><span>(oldbits.</span><span style="color:#bf616a;">isImmortal</span><span>())
+</span><span>        </span><span style="color:#b48ead;">return</span><span>;
+</span><span>      </span><span style="color:#b48ead;">return </span><span style="color:#bf616a;">incrementSlow</span><span>(oldbits, inc);
+</span><span>    }
+</span><span>  } </span><span style="color:#b48ead;">while </span><span>(!refCounts.</span><span style="color:#bf616a;">compare_exchange_weak</span><span>(oldbits, newbits,
+</span><span>                                            std::memory_order_relaxed));
+</span><span>}
+</span></code></pre>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">template </span><span>&lt;</span><span style="color:#b48ead;">typename</span><span> RefCountBits&gt;
+</span><span style="color:#b48ead;">void </span><span>RefCounts&lt;RefCountBits&gt;::</span><span style="color:#8fa1b3;">incrementSlow</span><span>(RefCountBits </span><span style="color:#bf616a;">oldbits</span><span>,
+</span><span>                                            uint32_t </span><span style="color:#bf616a;">n</span><span>) {
+</span><span>  </span><span style="color:#b48ead;">if </span><span>(oldbits.</span><span style="color:#bf616a;">isImmortal</span><span>()) {
+</span><span>    </span><span style="color:#b48ead;">return</span><span>;
+</span><span>  }
+</span><span>  </span><span style="color:#b48ead;">else if </span><span>(oldbits.</span><span style="color:#bf616a;">hasSideTable</span><span>()) {
+</span><span>    </span><span style="color:#b48ead;">auto</span><span> side = oldbits.</span><span style="color:#bf616a;">getSideTable</span><span>();
+</span><span>    </span><span style="color:#65737e;">// ---&gt; 然后调用到这里。
+</span><span>    side-&gt;</span><span style="color:#bf616a;">incrementStrong</span><span>(n);
+</span><span>  }
+</span><span>  </span><span style="color:#b48ead;">else </span><span>{
+</span><span>    swift::</span><span style="color:#bf616a;">swift_abortRetainOverflow</span><span>();
+</span><span>  }
+</span><span>}
+</span></code></pre>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">void </span><span>HeapObjectSideTableEntry::</span><span style="color:#8fa1b3;">incrementStrong</span><span>(uint32_t </span><span style="color:#bf616a;">inc</span><span>) {
+</span><span>  </span><span style="color:#65737e;">// 最终到这里，refCounts 是一个 RefCounts&lt;SideTableRefCountBits&gt; 对象。
+</span><span>  refCounts.</span><span style="color:#bf616a;">increment</span><span>(inc);
+</span><span>}
+</span></code></pre>
+<p>到这里我们就需要引出 <code>SideTableRefCountBits</code> 了，它与前面的 <code>InlineRefCountBits</code> 很像，只不过又多了一个字段，看一下定义：</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">class </span><span style="color:#ebcb8b;">SideTableRefCountBits </span><span style="color:#eff1f5;">: </span><span style="color:#b48ead;">public </span><span style="color:#a3be8c;">RefCountBitsT</span><span style="color:#eff1f5;">&lt;RefCountNotInline&gt;
+</span><span style="color:#eff1f5;">{
+</span><span style="color:#eff1f5;">  uint32_t weakBits;
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">  </span><span style="color:#65737e;">// ...
+</span><span style="color:#eff1f5;">
+</span><span style="color:#eff1f5;">}</span><span>;
+</span></code></pre>
+<h4 id="xiao-jie-yi-xia">小结一下</h4>
+<p>不知道上面的内容大家看晕了没有，反正我一开始分析的时候费了点时间。</p>
+<p>上面我们讲了两种 <code>RefCounts</code>，一种是 inline 的，用在 <code>HeapObject</code> 中，它其实是一个 <code>uint64_t</code>，可以当引用计数也可以当 Side Table 的指针。</p>
+<p>Side Table 是一种类名为 <code>HeapObjectSideTableEntry</code> 的结构，里面也有 <code>RefCounts</code> 成员，是内部是 <code>SideTableRefCountBits</code>，其实就是原来的 <code>uint64_t</code> 加上一个存储弱引用数的 <code>uint32_t</code>。</p>
+<h3 id="weakreference"><code>WeakReference</code></h3>
+<p>上面说的都是被引用的对象所涉及的逻辑，而引用者这边的逻辑就稍微简单一些了，主要就是通过 <code>WeakReference</code> 这个类来实现的，比较简单，我们简单过一下就行。</p>
+<p>Swift 中的 <code>weak</code> 变量经过 silgen 之后都会变成 <code>swift::swift_weakAssign</code> 调用，然后派发给 <code>WeakReference::nativeAssign</code>：</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">void </span><span style="color:#8fa1b3;">nativeAssign</span><span>(HeapObject *</span><span style="color:#bf616a;">newObject</span><span>) {
+</span><span>  </span><span style="color:#b48ead;">if </span><span>(newObject) {
+</span><span>    </span><span style="color:#96b5b4;">assert</span><span>(</span><span style="color:#bf616a;">objectUsesNativeSwiftReferenceCounting</span><span>(newObject) &amp;&amp;
+</span><span>           &quot;</span><span style="color:#a3be8c;">weak assign native with non-native new object</span><span>&quot;);
+</span><span>  }
+</span><span>
+</span><span>  </span><span style="color:#65737e;">// 让被引用者构造 Side Table。
+</span><span>  </span><span style="color:#b48ead;">auto</span><span> newSide =
+</span><span>    newObject ? newObject-&gt;</span><span style="color:#bf616a;">refCounts</span><span>.</span><span style="color:#bf616a;">formWeakReference</span><span>() : </span><span style="color:#d08770;">nullptr</span><span>;
+</span><span>  </span><span style="color:#b48ead;">auto</span><span> newBits = </span><span style="color:#bf616a;">WeakReferenceBits</span><span>(newSide);
+</span><span>
+</span><span>  </span><span style="color:#65737e;">// 喜闻乐见的 CAS。
+</span><span>  </span><span style="color:#b48ead;">auto</span><span> oldBits = nativeValue.</span><span style="color:#bf616a;">load</span><span>(std::memory_order_relaxed);
+</span><span>  nativeValue.</span><span style="color:#bf616a;">store</span><span>(newBits, std::memory_order_relaxed);
+</span><span>
+</span><span>  </span><span style="color:#96b5b4;">assert</span><span>(oldBits.</span><span style="color:#bf616a;">isNativeOrNull</span><span>() &amp;&amp;
+</span><span>         &quot;</span><span style="color:#a3be8c;">weak assign native with non-native old object</span><span>&quot;);
+</span><span>  </span><span style="color:#65737e;">// 销毁原来对象的弱引用。
+</span><span>  </span><span style="color:#bf616a;">destroyOldNativeBits</span><span>(oldBits);
+</span><span>}
+</span></code></pre>
+<p>弱引用的访问就更简单了：</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span>HeapObject *</span><span style="color:#8fa1b3;">nativeLoadStrongFromBits</span><span>(WeakReferenceBits </span><span style="color:#bf616a;">bits</span><span>) {
+</span><span>  </span><span style="color:#b48ead;">auto</span><span> side = bits.</span><span style="color:#bf616a;">getNativeOrNull</span><span>();
+</span><span>  </span><span style="color:#b48ead;">return</span><span> side ? side-&gt;</span><span style="color:#bf616a;">tryRetain</span><span>() : </span><span style="color:#d08770;">nullptr</span><span>;
+</span><span>}
+</span></code></pre>
+<p>到这里大家发现一个问题没有，被引用对象释放了为什么还能直接访问 Side Table？其实 Swift ABI 中 Side Table 的生命周期与对象是分离的，当强引用计数为 0 时，只有 <code>HeapObject</code> 被释放了。</p>
+<p>只有所有的 <code>weak</code> 引用者都被释放了或相关变量被置 <code>nil</code> 后，Side Table 才能得以释放，详见：</p>
+<pre data-lang="cpp" style="background-color:#2b303b;color:#c0c5ce;" class="language-cpp "><code class="language-cpp" data-lang="cpp"><span style="color:#b48ead;">void </span><span>HeapObjectSideTableEntry::</span><span style="color:#8fa1b3;">decrementWeak</span><span>() {
+</span><span>  </span><span style="color:#65737e;">// FIXME: assertions
+</span><span>  </span><span style="color:#65737e;">// FIXME: optimize barriers
+</span><span>  </span><span style="color:#b48ead;">bool</span><span> cleanup = refCounts.</span><span style="color:#bf616a;">decrementWeakShouldCleanUp</span><span>();
+</span><span>  </span><span style="color:#b48ead;">if </span><span>(!cleanup)
+</span><span>    </span><span style="color:#b48ead;">return</span><span>;
+</span><span>
+</span><span>  </span><span style="color:#65737e;">// Weak ref count is now zero. Delete the side table entry.
+</span><span>  </span><span style="color:#65737e;">// FREED -&gt; DEAD
+</span><span>  </span><span style="color:#96b5b4;">assert</span><span>(refCounts.</span><span style="color:#bf616a;">getUnownedCount</span><span>() == </span><span style="color:#d08770;">0</span><span>);
+</span><span>  </span><span style="color:#b48ead;">delete </span><span style="color:#bf616a;">this</span><span>;
+</span><span>}
+</span></code></pre>
+<p>所以即便使用了弱引用，也不能保证相关内存全部被释放，因为只要 <code>weak</code> 变量不被显式置 <code>nil</code>，Side Table 就会存在。而 ABI 中也有可以提升的地方，那就是如果访问弱引用变量时发现被引用对象已经释放，就将自己的弱引用销毁掉，避免之后重复无意义的 CAS 操作。当然 ABI 不做这个优化，我们也可以在 Swift 代码里做。:)</p>
+<h2 id="zong-jie">总结</h2>
+<p>以上就是 Swift 弱引用机制实现方式的一个简单的分析，可见思路与 Objective-C runtime 还是很类似的，都采用与对象匹配的 Side Table 来维护引用计数。不同的地方就是 Objective-C 对象在内存布局中没有 Side Table 指针，而是通过一个全局的 <code>StripedMap</code> 来维护对象和 Side Table 之间的关系，效率没有 Swift 这么高。另外 Objective-C runtime 在对象释放时会将所有的 <code>__weak</code> 变量都 zero-out，而 Swift 并没有。</p>
+<p>总的来说，Swift 的实现方式会稍微简单一些（虽然代码更复杂，Swift 团队追求更高的抽象）。第一次分析 Swift ABI，本文仅供参考，如果存在错误，欢迎大家勘正。感谢！</p>
+
+        </div>
+
+                </div>
+            <div class="pagination">
+                <div class="pagination__buttons">
+                    <span class="button previous">
+                        <a href="https://unixzii.github.io/page/3/">
+                            <span class="button__icon">←</span>&nbsp;
+                            <span class="button__text">Newer posts</span>
+                        </a>
+                    </span>
+                </div>
+            </div>
+        </div>
+        
+
+        
+        <footer class="footer">
+                <div class="copyright">
+                        <span>© 
+    2022
+ Cyandev</span>
+                        <span class="copyright-sep">::  </span>
+                        <span>Powered by <a href="https://www.getzola.org/">Zola</a></span>
+                    
+                </div>
+            </footer>
+        
+    </div>
+
+</div>
+</body>
+
+</html>
